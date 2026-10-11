@@ -70,6 +70,10 @@ fn assert_share_one_segment(sizes: &[usize]) {
 // `one_past_the_boundary_is_huge_and_correct`) runs at every geometry.
 #[cfg(not(ra_small_profile))]
 #[test]
+#[cfg_attr(
+    feature = "debug_checks",
+    ignore = "debug_checks keeps freed blocks in a quarantine behind a header, which changes the reuse and layout this checks"
+)]
 fn twenty_mib_span_shares_its_segment() {
     assert_share_one_segment(&[20 * MIB, 8 * MIB, 62 * 64 * 1024]);
 }
@@ -112,6 +116,10 @@ fn sixteen_mib_tail_is_usable() {
 /// USABLE_SLICES = 511 slices = 32 MiB - 64 KiB, and it must be served
 /// in-segment (payload begins one header slice past the segment base).
 #[test]
+#[cfg_attr(
+    feature = "debug_checks",
+    ignore = "debug_checks keeps freed blocks in a quarantine behind a header, which changes the reuse and layout this checks"
+)]
 fn maximum_span_fills_one_segment_exactly() {
     let n = rusty_alloc::types::LARGE_OBJ_SIZE_MAX;
     let p = malloc(n);

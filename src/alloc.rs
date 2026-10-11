@@ -237,6 +237,10 @@ fn stat_realloc(in_place: bool) {
 /// path also needs no callee-saved registers.
 #[inline]
 pub fn malloc(size: usize) -> *mut u8 {
+    #[cfg(feature = "debug_checks")]
+    if let Some(p) = crate::debug::raw::malloc(ptr::null_mut(), size, false) {
+        return p;
+    }
     let hb = init::heap_box_fast();
     // SAFETY: raw reads only — `hb` may be the shared immortal sentinel (see
     // `heap_box_fast`), which must never see a `&mut` or a write. `direct`
@@ -281,6 +285,10 @@ pub fn malloc(size: usize) -> *mut u8 {
 /// at each inlined call site.
 #[inline]
 pub fn malloc_or(size: usize, on_oom: fn(usize) -> *mut u8) -> *mut u8 {
+    #[cfg(feature = "debug_checks")]
+    if let Some(p) = crate::debug::raw::malloc(ptr::null_mut(), size, false) {
+        return if p.is_null() { on_oom(size) } else { p };
+    }
     let hb = init::heap_box_fast();
     // SAFETY: as [`malloc`] — raw reads only, `hb` may be the immortal
     // sentinel, and `page_pop` on the sentinel returns null before any store.
@@ -447,6 +455,10 @@ fn malloc_first(size: usize) -> *mut u8 {
 
 /// Allocate `size` zeroed bytes.
 pub fn zalloc(size: usize) -> *mut u8 {
+    #[cfg(feature = "debug_checks")]
+    if let Some(p) = crate::debug::raw::malloc(ptr::null_mut(), size, true) {
+        return p;
+    }
     // Same TLS shape as `malloc` and `malloc_aligned_at`: `heap_box_fast` and
     // one compare against the shared sentinel, not `my_heap` — which goes
     // through `heap_box`, the variant that CREATES the heap when it finds the
@@ -577,6 +589,12 @@ pub fn malloc_aligned(size: usize, align: usize) -> *mut u8 {
 // reverted. The export gains a frame worth more than the check it removes,
 // the same result the `realloc_inline` twin produced.
 pub fn malloc_aligned_at(size: usize, align: usize, offset: usize) -> *mut u8 {
+    #[cfg(feature = "debug_checks")]
+    if let Some(p) =
+        crate::debug::raw::malloc_aligned_at(ptr::null_mut(), size, align, offset, false)
+    {
+        return p;
+    }
     aligned_at_impl::<false>(size, align, offset)
 }
 
@@ -593,6 +611,10 @@ pub fn malloc_aligned_at(size: usize, align: usize, offset: usize) -> *mut u8 {
 #[inline]
 pub unsafe fn malloc_aligned_pow2(size: usize, align: usize) -> *mut u8 {
     ra_debug_assert!(align.is_power_of_two(), "malloc_aligned_pow2: {align}");
+    #[cfg(feature = "debug_checks")]
+    if let Some(p) = crate::debug::raw::malloc_aligned_at(ptr::null_mut(), size, align, 0, false) {
+        return p;
+    }
     aligned_at_impl::<true>(size, align, 0)
 }
 
@@ -727,6 +749,36 @@ fn malloc_aligned_first(size: usize, align: usize, offset: usize) -> *mut u8 {
     }
 }
 
+/// Debug mode's way into the core (`debug_checks`): `size` bytes with
+/// `(p + offset) % align == 0` from `hb`'s heap (the calling thread's when
+/// null), never through the debug layer.
+///
+/// # Safety
+/// `hb` is null or a heap box owned by the calling thread.
+#[cfg(feature = "debug_checks")]
+pub(crate) unsafe fn core_alloc(
+    hb: *mut init::HeapBox,
+    size: usize,
+    align: usize,
+    offset: usize,
+) -> *mut u8 {
+    let hb = if hb.is_null() { init::heap_box() } else { hb };
+    if hb.is_null() {
+        return ptr::null_mut(); // heap creation failed: OOM => null
+    }
+    // SAFETY: per contract a live box of this thread; no reference to its
+    // heap is live here.
+    unsafe {
+        let h = (*hb).heap.get();
+        fire_deferred_if_due(h);
+        if align <= 16 && offset == 0 {
+            (*h).malloc(size).0
+        } else {
+            (*h).malloc_aligned_at(size, align, offset).0
+        }
+    }
+}
+
 /// `mi_zalloc_aligned`.
 pub fn zalloc_aligned(size: usize, align: usize) -> *mut u8 {
     zalloc_aligned_at(size, align, 0)
@@ -734,6 +786,12 @@ pub fn zalloc_aligned(size: usize, align: usize) -> *mut u8 {
 
 /// `mi_zalloc_aligned_at`.
 pub fn zalloc_aligned_at(size: usize, align: usize, offset: usize) -> *mut u8 {
+    #[cfg(feature = "debug_checks")]
+    if let Some(p) =
+        crate::debug::raw::malloc_aligned_at(ptr::null_mut(), size, align, offset, true)
+    {
+        return p;
+    }
     // SIBLING CHECK: `zalloc` and `malloc_aligned_at` were both moved off
     // `my_heap` — the variant that CREATES the heap on finding the sentinel,
     // and so carries the once-per-thread initialisation and a null check on a
@@ -810,6 +868,16 @@ pub unsafe fn realloc_aligned_at(
     align: usize,
     offset: usize,
 ) -> *mut u8 {
+    #[cfg(feature = "debug_checks")]
+    {
+        // SAFETY: forwarded contract.
+        let r = unsafe {
+            crate::debug::raw::realloc(ptr::null_mut(), p, newsize, align, offset, false)
+        };
+        if let Some(np) = r {
+            return np;
+        }
+    }
     if p.is_null() {
         return malloc_aligned_at(newsize, align, offset);
     }
@@ -879,6 +947,15 @@ pub unsafe fn rezalloc_aligned_at(
     align: usize,
     offset: usize,
 ) -> *mut u8 {
+    #[cfg(feature = "debug_checks")]
+    {
+        // SAFETY: forwarded contract.
+        let r =
+            unsafe { crate::debug::raw::realloc(ptr::null_mut(), p, newsize, align, offset, true) };
+        if let Some(np) = r {
+            return np;
+        }
+    }
     if p.is_null() {
         return if align <= 1 {
             zalloc(newsize)
@@ -980,6 +1057,14 @@ pub unsafe fn free(p: *mut u8) {
 /// As [`free`].
 #[inline(always)]
 pub unsafe fn free_inline(p: *mut u8) {
+    // Debug mode checks every free; the core takes over only for a block
+    // without a debug header (a block start), which includes the debug
+    // layer's own frees of the core blocks under its blocks.
+    #[cfg(feature = "debug_checks")]
+    // SAFETY: forwarded contract.
+    if unsafe { crate::debug::raw::free(p) } {
+        return;
+    }
     // REFUTED TWICE (2026-08-22): folding the null test into the segment mask, the
     // way mimalloc does (`lea -0x1(%rdi),%rsi; and mask,%rsi; jle` — a block is
     // never at offset 0, so masking `p - 1` picks the same segment, and NULL
@@ -1389,6 +1474,11 @@ unsafe fn free_general(p: *mut u8, seg: *mut Segment, pg: *mut Page, owner_tid: 
 /// # Safety
 /// `p` must be null or a live pointer from this allocator.
 pub unsafe fn usable_size(p: *const u8) -> usize {
+    #[cfg(feature = "debug_checks")]
+    // SAFETY: forwarded contract.
+    if let Some(n) = unsafe { crate::debug::raw::usable_size(p.cast_mut()) } {
+        return n;
+    }
     if p.is_null() {
         return 0;
     }
@@ -1470,6 +1560,14 @@ unsafe fn usable_size_slow(pg: *mut Page, p: *const u8, flags: u8) -> usize {
 /// [`realloc_live`] with its arguments already in place.
 #[inline]
 pub unsafe fn realloc(p: *mut u8, newsize: usize) -> *mut u8 {
+    #[cfg(feature = "debug_checks")]
+    {
+        // SAFETY: forwarded contract.
+        let r = unsafe { crate::debug::raw::realloc(ptr::null_mut(), p, newsize, 16, 0, false) };
+        if let Some(np) = r {
+            return np;
+        }
+    }
     if p.is_null() {
         return malloc(newsize);
     }
@@ -1597,6 +1695,11 @@ pub unsafe fn reallocf(p: *mut u8, newsize: usize) -> *mut u8 {
 /// # Safety
 /// `p` must be null or a live pointer from this allocator.
 pub unsafe fn expand(p: *mut u8, newsize: usize) -> *mut u8 {
+    #[cfg(feature = "debug_checks")]
+    // SAFETY: forwarded contract.
+    if let Some(np) = unsafe { crate::debug::raw::expand(p, newsize) } {
+        return np;
+    }
     if p.is_null() {
         return ptr::null_mut();
     }
@@ -1664,6 +1767,10 @@ unsafe fn heap_of(hb: *mut init::HeapBox) -> *mut Heap {
 /// # Safety
 /// `hb` live and owned by the calling thread.
 pub unsafe fn heap_malloc(hb: *mut init::HeapBox, size: usize) -> *mut u8 {
+    #[cfg(feature = "debug_checks")]
+    if let Some(p) = crate::debug::raw::malloc(hb, size, false) {
+        return p;
+    }
     // SAFETY: forwarded contract.
     unsafe {
         let h = heap_of(hb);
@@ -1677,6 +1784,10 @@ pub unsafe fn heap_malloc(hb: *mut init::HeapBox, size: usize) -> *mut u8 {
 /// # Safety
 /// As [`heap_malloc`].
 pub unsafe fn heap_zalloc(hb: *mut init::HeapBox, size: usize) -> *mut u8 {
+    #[cfg(feature = "debug_checks")]
+    if let Some(p) = crate::debug::raw::malloc(hb, size, true) {
+        return p;
+    }
     // SAFETY: forwarded contract.
     unsafe {
         let h = heap_of(hb);
@@ -1699,6 +1810,10 @@ pub unsafe fn heap_malloc_aligned_at(
     align: usize,
     offset: usize,
 ) -> *mut u8 {
+    #[cfg(feature = "debug_checks")]
+    if let Some(p) = crate::debug::raw::malloc_aligned_at(hb, size, align, offset, false) {
+        return p;
+    }
     // SAFETY: forwarded contract.
     unsafe {
         let h = heap_of(hb);
@@ -1717,6 +1832,10 @@ pub unsafe fn heap_zalloc_aligned_at(
     align: usize,
     offset: usize,
 ) -> *mut u8 {
+    #[cfg(feature = "debug_checks")]
+    if let Some(p) = crate::debug::raw::malloc_aligned_at(hb, size, align, offset, true) {
+        return p;
+    }
     // SAFETY: forwarded contract.
     unsafe {
         let h = heap_of(hb);
@@ -1735,6 +1854,11 @@ pub unsafe fn heap_zalloc_aligned_at(
 /// # Safety
 /// As [`heap_malloc`]; `p` as [`realloc`].
 pub unsafe fn heap_realloc(hb: *mut init::HeapBox, p: *mut u8, newsize: usize) -> *mut u8 {
+    #[cfg(feature = "debug_checks")]
+    // SAFETY: forwarded contract.
+    if let Some(np) = unsafe { crate::debug::raw::realloc(hb, p, newsize, 16, 0, false) } {
+        return np;
+    }
     if p.is_null() {
         // SAFETY: forwarded contract.
         return unsafe { heap_malloc(hb, newsize) };

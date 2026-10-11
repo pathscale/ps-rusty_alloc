@@ -5,6 +5,10 @@
 use rusty_alloc::alloc::{expand, free, malloc, realloc, stats, usable_size, zalloc};
 
 #[test]
+#[cfg_attr(
+    feature = "debug_checks",
+    ignore = "debug_checks keeps freed blocks in a quarantine behind a header, which changes the reuse and layout this checks"
+)]
 fn span_lifecycle_and_realloc() {
     // Sizes derived from the geometry, not written in MiB. "1 MiB" is a
     // 16-slice large span at the shipped 32 MiB segment and a HUGE block at a

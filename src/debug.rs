@@ -14,6 +14,8 @@
 use core::fmt;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
+pub mod stack;
+
 /// What a check found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ViolationKind {
@@ -209,14 +211,14 @@ pub(crate) fn report(v: &Violation) {
 /// A fixed stack buffer for one formatted line: reports must not allocate,
 /// they run inside the allocator. Output past the end is cut.
 pub(crate) struct Line {
-    buf: [u8; 256],
+    buf: [u8; 512],
     len: usize,
 }
 
 impl Line {
     pub(crate) const fn new() -> Self {
         Self {
-            buf: [0; 256],
+            buf: [0; 512],
             len: 0,
         }
     }

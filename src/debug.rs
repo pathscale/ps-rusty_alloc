@@ -6,15 +6,22 @@
 //! the survey it follows and the defaults.
 //!
 //! A failed check builds a [`Violation`] and hands it to the handler. The
-//! default handler prints one line to stderr (through the output hook, see
-//! `options::register_output`) and aborts, which is what mimalloc's debug
-//! build does on heap corruption. [`set_handler`] replaces it, for example
-//! to log and continue, as `mi_register_error` does.
+//! default handler prints the finding with its call stacks to stderr
+//! (through the output hook, see `options::register_output`) and aborts,
+//! which is what mimalloc's debug build does on heap corruption.
+//! [`set_handler`] replaces it, for example to log and continue, as
+//! `mi_register_error` does.
+//!
+//! Every block records the call stack that allocated it, and a freed block
+//! the stack that freed it ([`stack`]), so leak and violation reports name
+//! call sites the way AddressSanitizer and heaptrack do.
 
 use core::fmt;
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
 pub mod stack;
+
+pub use stack::StackId;
 
 /// What a check found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,7 +73,8 @@ impl ViolationKind {
     }
 }
 
-/// One failed check. Fields that do not apply to a kind are 0.
+/// One failed check. Fields that do not apply to a kind are 0 (stacks
+/// [`StackId::NONE`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Violation {
     /// What was found.
@@ -86,6 +94,19 @@ pub struct Violation {
     pub offset: usize,
     /// The block's allocation number on its thread (counted per thread from 1).
     pub seq: u64,
+    /// Thread that found it (debug thread number, from 1; 0 unknown).
+    pub thread: u32,
+    /// Where it was found: the call into the allocator (or the eviction from
+    /// quarantine, for a write after free).
+    pub stack: StackId,
+    /// Where the block was allocated, when the block is known.
+    pub alloc_stack: StackId,
+    /// Thread that allocated the block.
+    pub alloc_thread: u32,
+    /// Where the block was freed: double frees and writes after free.
+    pub free_stack: StackId,
+    /// Thread that freed the block.
+    pub free_thread: u32,
 }
 
 impl Violation {
@@ -99,6 +120,26 @@ impl Violation {
             block_align: 0,
             offset: 0,
             seq: 0,
+            thread: 0,
+            stack: StackId::NONE,
+            alloc_stack: StackId::NONE,
+            alloc_thread: 0,
+            free_stack: StackId::NONE,
+            free_thread: 0,
+        }
+    }
+
+    /// Take the block's recorded size, alignment, number and call sites.
+    const fn block(&mut self, h: &Header) {
+        self.block_size = h.size as usize;
+        self.block_align = h.align as usize;
+        self.alloc_stack = StackId(h.alloc_stack);
+        self.alloc_thread = h.alloc_tid;
+        if h.state == FREED {
+            self.free_stack = StackId(h.free_stack);
+            self.free_thread = h.free_tid;
+        } else {
+            self.seq = h.seq;
         }
     }
 }
@@ -181,30 +222,62 @@ pub fn set_handler(h: Option<Handler>) -> Option<Handler> {
     }
 }
 
-/// The default handler: print `rusty_alloc: error: <violation>` and abort.
+/// The default handler: print the report ([`print_violation`]) and abort.
 pub fn default_handler(v: &Violation) {
     print_violation(v);
     crate::abort();
 }
 
-/// Print one violation line through the output hook, without allocating.
+/// Print a violation through the output hook, without allocating: the line
+/// `rusty_alloc: error: <violation>`, then, in AddressSanitizer's order, the
+/// stack where it was found, the stack that freed the block and the stack
+/// that allocated it, each that is known. Frames are raw return addresses
+/// with their image and offset; `tools/symbolize.ts` resolves them.
 pub fn print_violation(v: &Violation) {
-    let mut b = Line::new();
-    let _ = fmt::write(&mut b, format_args!("rusty_alloc: error: {v}\n"));
-    crate::options::out_fmt(b.as_str());
+    line(format_args!("rusty_alloc: error: {v}\n"));
+    if !v.stack.is_none() {
+        line(format_args!(
+            "rusty_alloc:   found by thread T{} here:\n",
+            v.thread
+        ));
+        stack::print_stack(v.stack);
+    }
+    if !v.free_stack.is_none() {
+        line(format_args!(
+            "rusty_alloc:   freed by thread T{} here:\n",
+            v.free_thread
+        ));
+        stack::print_stack(v.free_stack);
+    }
+    if !v.alloc_stack.is_none() {
+        line(format_args!(
+            "rusty_alloc:   previously allocated by thread T{} here:\n",
+            v.alloc_thread
+        ));
+        stack::print_stack(v.alloc_stack);
+    }
 }
 
-/// Hand `v` to the handler. Returns only if the handler returned.
+/// Hand `v` to the handler. Returns only if the handler returned. Fills in
+/// the finding thread, and the stack where it was found when the caller did
+/// not capture one.
 #[cold]
 #[inline(never)]
 pub(crate) fn report(v: &Violation) {
+    let mut v = *v;
+    if v.thread == 0 {
+        v.thread = thread_debug().map_or(0, thread_no);
+    }
+    if v.stack.is_none() {
+        v.stack = here();
+    }
     let h = HANDLER.load(Ordering::Acquire);
     if h.is_null() {
-        default_handler(v);
+        default_handler(&v);
     } else {
         // SAFETY: see `set_handler`.
         let f = unsafe { core::mem::transmute::<*mut (), Handler>(h) };
-        f(v);
+        f(&v);
     }
 }
 
@@ -259,6 +332,15 @@ pub(crate) struct ThreadDebug {
     q_tail: core::cell::Cell<*mut u8>,
     /// Bytes (requested sizes) in the quarantine.
     q_bytes: core::cell::Cell<usize>,
+    /// Debug thread number, from 1; 0 until first needed.
+    tid: core::cell::Cell<u32>,
+    /// This thread's stack bounds for the frame walk; `hi == 0` until first
+    /// needed.
+    stack_lo: core::cell::Cell<usize>,
+    stack_hi: core::cell::Cell<usize>,
+    /// Set while the bounds are looked up: a lookup that allocates (the C
+    /// library on Linux may) does not capture again.
+    in_capture: core::cell::Cell<bool>,
     /// Counters, merged across threads only when a report asks.
     c: core::cell::UnsafeCell<DebugStats>,
 }
@@ -270,6 +352,10 @@ impl ThreadDebug {
             q_head: core::cell::Cell::new(core::ptr::null_mut()),
             q_tail: core::cell::Cell::new(core::ptr::null_mut()),
             q_bytes: core::cell::Cell::new(0),
+            tid: core::cell::Cell::new(0),
+            stack_lo: core::cell::Cell::new(0),
+            stack_hi: core::cell::Cell::new(0),
+            in_capture: core::cell::Cell::new(false),
             c: core::cell::UnsafeCell::new(DebugStats::new()),
         }
     }
@@ -288,12 +374,76 @@ fn thread_debug() -> Option<&'static ThreadDebug> {
     Some(unsafe { &(*hb).dbg })
 }
 
+static NEXT_TID: AtomicU32 = AtomicU32::new(0);
+
+/// The debug number of the thread owning `d`: 1, 2, ... in the order threads
+/// first need one.
+fn thread_no(d: &ThreadDebug) -> u32 {
+    let t = d.tid.get();
+    if t != 0 {
+        return t;
+    }
+    let t = NEXT_TID
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1)
+        .max(1);
+    d.tid.set(t);
+    t
+}
+
+/// The calling thread's debug number (0 if it has no heap).
+pub fn thread_number() -> u32 {
+    thread_debug().map_or(0, thread_no)
+}
+
+/// The calling thread's stack bounds, looked up once per thread.
+fn stack_bounds() -> (usize, usize) {
+    let Some(d) = thread_debug() else {
+        return stack::thread_stack_bounds();
+    };
+    if d.stack_hi.get() == 0 {
+        if d.in_capture.get() {
+            return (0, 0);
+        }
+        d.in_capture.set(true);
+        let (lo, hi) = stack::thread_stack_bounds();
+        d.in_capture.set(false);
+        d.stack_lo.set(lo);
+        d.stack_hi.set(hi.max(1));
+    }
+    (d.stack_lo.get(), d.stack_hi.get())
+}
+
+/// Stack of the caller's caller: called at the top of a debug entry point,
+/// it records where the program called into the allocator.
+#[inline(never)]
+fn here() -> StackId {
+    if !stack::SUPPORTED || stack::stack_depth() == 0 {
+        return StackId::NONE;
+    }
+    let (lo, hi) = stack_bounds();
+    // Records: into `here`, into the entry point, then the program.
+    stack::capture_in(lo, hi, 2)
+}
+
+/// Capture the calling function's stack into the depot (debug mode keeps
+/// the bounds per thread). For tagging your own events; the allocator
+/// records its own call sites.
+#[inline(never)]
+pub fn capture() -> StackId {
+    if !stack::SUPPORTED || stack::stack_depth() == 0 {
+        return StackId::NONE;
+    }
+    let (lo, hi) = stack_bounds();
+    stack::capture_in(lo, hi, 1)
+}
+
 // ---------------------------------------------------------------------------
-// Block layout: [header 32 B][user size B][canary 8 B]
+// Block layout: [header 48 B][user size B][canary 8 B]
 // ---------------------------------------------------------------------------
 
 /// Header bytes in front of every debug block.
-const HDR: usize = 32;
+const HDR: usize = 48;
 /// Canary bytes after every debug block.
 const TRAILER: usize = 8;
 /// Fill of a fresh, non-zeroed allocation (mimalloc's `MI_DEBUG_UNINIT`).
@@ -312,21 +462,46 @@ const FREED: u32 = 0x4652_4545;
 #[repr(C)]
 struct Header {
     seq: u64,
-    size: usize,
-    align: u32,
+    size: u64,
+    alloc_stack: u32,
+    free_stack: u32,
+    alloc_tid: u32,
+    free_tid: u32,
     state: u32,
+    align: u32,
     check: u64,
 }
 
 const _: () = assert!(core::mem::size_of::<Header>() == HDR);
 
+impl Header {
+    const fn live(seq: u64, size: usize, align: usize, stack: StackId, tid: u32) -> Self {
+        Self {
+            seq,
+            size: size as u64,
+            alloc_stack: stack.0,
+            free_stack: 0,
+            alloc_tid: tid,
+            free_tid: 0,
+            state: LIVE,
+            align: align as u32,
+            check: 0,
+        }
+    }
+}
+
 /// Header checksum, keyed by the block address so a header copied or left
 /// behind at another address does not validate (Scudo's chunk checksum).
-const fn checksum(user: usize, seq: u64, size: usize, align: u32, state: u32) -> u64 {
+const fn checksum(user: usize, h: &Header) -> u64 {
+    let seq = if h.state == FREED { 0 } else { h.seq };
     let mut x = (user as u64) ^ 0x7275_7374_795f_6462;
     x = (x ^ seq).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    x = (x ^ size as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    x = (x ^ (((align as u64) << 32) | state as u64)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x = (x ^ h.size).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (((h.align as u64) << 32) | h.state as u64)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x = (x ^ (((h.alloc_stack as u64) << 32) | h.free_stack as u64))
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (((h.alloc_tid as u64) << 32) | h.free_tid as u64))
+        .wrapping_mul(0xBF58_476D_1CE4_E5B9);
     x ^ (x >> 31)
 }
 
@@ -342,33 +517,21 @@ enum State {
 unsafe fn read_header(user: *mut u8) -> (State, Header) {
     // SAFETY: per contract; unaligned-safe read.
     let h = unsafe { user.sub(HDR).cast::<Header>().read_unaligned() };
-    let a = user.addr();
-    let st = if h.state == LIVE && h.check == checksum(a, h.seq, h.size, h.align, LIVE) {
-        State::Live
-    } else if h.state == FREED && h.check == checksum(a, 0, h.size, h.align, FREED) {
-        State::Freed
-    } else {
-        State::Bad
+    let ok = h.check == checksum(user.addr(), &h);
+    let st = match h.state {
+        LIVE if ok => State::Live,
+        FREED if ok => State::Freed,
+        _ => State::Bad,
     };
     (st, h)
 }
 
+/// Write `h` with a fresh checksum.
+///
 /// # Safety
 /// `user - HDR .. user` is writable and ours.
-unsafe fn write_header(user: *mut u8, seq: u64, size: usize, align: usize, state: u32) {
-    let align = align as u32;
-    let check = if state == LIVE {
-        checksum(user.addr(), seq, size, align, LIVE)
-    } else {
-        checksum(user.addr(), 0, size, align, FREED)
-    };
-    let h = Header {
-        seq,
-        size,
-        align,
-        state,
-        check,
-    };
+unsafe fn write_header(user: *mut u8, mut h: Header) {
+    h.check = checksum(user.addr(), &h);
     // SAFETY: per contract.
     unsafe { user.sub(HDR).cast::<Header>().write_unaligned(h) };
 }
@@ -407,9 +570,23 @@ unsafe fn first_not(p: *const u8, b: u8, n: usize) -> Option<usize> {
 
 /// Debug `GlobalAlloc::alloc` / `alloc_zeroed`.
 ///
+/// Entry points stay out of line, so the call site is always the frame right
+/// above them.
+///
 /// # Safety
 /// `GlobalAlloc::alloc` contract.
+#[inline(never)]
 pub(crate) unsafe fn alloc(layout: core::alloc::Layout, zero: bool) -> *mut u8 {
+    let st = here();
+    // SAFETY: forwarded.
+    unsafe { alloc_at(layout, zero, st) }
+}
+
+/// [`alloc`] with the call site already captured.
+///
+/// # Safety
+/// `GlobalAlloc::alloc` contract.
+unsafe fn alloc_at(layout: core::alloc::Layout, zero: bool, st: StackId) -> *mut u8 {
     at_exit_register();
     let size = layout.size();
     let align = layout.align();
@@ -418,7 +595,7 @@ pub(crate) unsafe fn alloc(layout: core::alloc::Layout, zero: bool) -> *mut u8 {
     };
     let raw = if align <= 16 {
         // A 16-multiple request lands in a 16-aligned bin, so the user
-        // pointer (`raw + 32`) is 16-aligned as well.
+        // pointer (`raw + HDR`, HDR a multiple of 16) is 16-aligned as well.
         let t = total & !15;
         if zero {
             crate::alloc::zalloc(t)
@@ -443,34 +620,37 @@ pub(crate) unsafe fn alloc(layout: core::alloc::Layout, zero: bool) -> *mut u8 {
             let mut v = Violation::new(ViolationKind::Misaligned, user.addr());
             v.size = size;
             v.align = align;
+            v.stack = st;
             report(&v);
         }
         if !zero {
             core::ptr::write_bytes(user, UNINIT_BYTE, size);
         }
         core::ptr::write_bytes(user.add(size), CANARY_BYTE, TRAILER);
-        let seq = thread_debug().map_or(0, |d| {
+        let (seq, tid) = thread_debug().map_or((0, 0), |d| {
             count(d, |c| c.on_alloc(size));
             let s = d.seq.get() + 1;
             d.seq.set(s);
-            s
+            (s, thread_no(d))
         });
-        write_header(user, seq, size, align, LIVE);
+        write_header(user, Header::live(seq, size, align, st, tid));
         user
     }
 }
 
 /// Check a pointer handed to `dealloc`/`realloc` against `layout`. Reports
 /// every finding; returns the header when the block is ours and may be
-/// released, `None` when releasing it would be unsafe.
+/// released, `None` when releasing it would be unsafe. `st` is the call
+/// site.
 ///
 /// # Safety
 /// None beyond `p` being non-null: every read is bounds-checked first.
-unsafe fn validate(p: *mut u8, layout: core::alloc::Layout) -> Option<Header> {
+unsafe fn validate(p: *mut u8, layout: core::alloc::Layout, st: StackId) -> Option<Header> {
     let a = p.addr();
     let mut v = Violation::new(ViolationKind::ForeignPointer, a);
     v.size = layout.size();
     v.align = layout.align();
+    v.stack = st;
     if !crate::segment_map::contains(p) {
         report(&v);
         return None;
@@ -497,8 +677,7 @@ unsafe fn validate(p: *mut u8, layout: core::alloc::Layout) -> Option<Header> {
             State::Live => {}
             State::Freed => {
                 v.kind = ViolationKind::DoubleFree;
-                v.block_size = h.size;
-                v.block_align = h.align as usize;
+                v.block(&h);
                 report(&v);
                 return None;
             }
@@ -516,26 +695,23 @@ unsafe fn validate(p: *mut u8, layout: core::alloc::Layout) -> Option<Header> {
                 } else {
                     v.kind = ViolationKind::InteriorPointer;
                     v.offset = a - u.addr();
-                    v.block_size = uh.size;
-                    v.block_align = uh.align as usize;
+                    v.block(&uh);
                 }
                 report(&v);
                 return None;
             }
         }
-        v.block_size = h.size;
-        v.block_align = h.align as usize;
-        v.seq = h.seq;
-        if h.size != layout.size() {
+        v.block(&h);
+        if h.size as usize != layout.size() {
             v.kind = ViolationKind::SizeMismatch;
             report(&v);
         } else if h.align as usize != layout.align() {
             v.kind = ViolationKind::AlignMismatch;
             report(&v);
         }
-        if let Some(i) = first_not(p.add(h.size), CANARY_BYTE, TRAILER) {
+        if let Some(i) = first_not(p.add(h.size as usize), CANARY_BYTE, TRAILER) {
             v.kind = ViolationKind::BufferOverflow;
-            v.offset = h.size + i;
+            v.offset = h.size as usize + i;
             report(&v);
         }
         Some(h)
@@ -583,29 +759,32 @@ pub fn quarantine_limit() -> usize {
     l
 }
 
-/// Hand a validated block back: poison it and park it in this thread's
-/// quarantine, releasing the oldest blocks past the budget.
+/// Hand a validated block back: poison it, record where it was freed, and
+/// park it in this thread's quarantine, releasing the oldest blocks past the
+/// budget.
 ///
 /// # Safety
 /// `p` passed [`validate`], which returned `h`.
-unsafe fn release(p: *mut u8, h: Header) {
+unsafe fn release(p: *mut u8, h: Header, st: StackId) {
+    let size = h.size as usize;
     // SAFETY: per contract the block is ours and live until handed on.
     unsafe {
-        core::ptr::write_bytes(p, FREED_BYTE, h.size);
-        write_header(p, 0, h.size, h.align as usize, FREED);
-        if let Some(d) = thread_debug() {
-            count(d, |c| c.on_free(h.size));
+        core::ptr::write_bytes(p, FREED_BYTE, size);
+        let d = thread_debug();
+        let mut fh = h;
+        fh.state = FREED;
+        fh.seq = 0;
+        fh.free_stack = st.0;
+        fh.free_tid = d.map_or(0, thread_no);
+        write_header(p, fh);
+        if let Some(d) = d {
+            count(d, |c| c.on_free(size));
         }
         let limit = quarantine_limit();
-        let Some(d) = thread_debug().filter(|_| h.size <= limit) else {
+        let Some(d) = d.filter(|_| size <= limit) else {
             crate::alloc::free(p.sub(HDR));
             return;
         };
-        // The link lives in the header's `seq` word, outside the checksum of
-        // a FREED header.
-        p.sub(HDR)
-            .cast::<*mut u8>()
-            .write_unaligned(core::ptr::null_mut());
         let tail = d.q_tail.get();
         if tail.is_null() {
             d.q_head.set(p);
@@ -613,7 +792,7 @@ unsafe fn release(p: *mut u8, h: Header) {
             tail.sub(HDR).cast::<*mut u8>().write_unaligned(p);
         }
         d.q_tail.set(p);
-        d.q_bytes.set(d.q_bytes.get() + h.size);
+        d.q_bytes.set(d.q_bytes.get() + size);
         while d.q_bytes.get() > limit && evict_one(d) {}
     }
 }
@@ -639,18 +818,20 @@ fn evict_one(d: &ThreadDebug) -> bool {
             report(&v);
             return true;
         }
+        let size = h.size as usize;
+        // The link lives in the header's `seq` word, outside the checksum of
+        // a FREED header.
         let next = p.sub(HDR).cast::<*mut u8>().read_unaligned();
         d.q_head.set(next);
         if next.is_null() {
             d.q_tail.set(core::ptr::null_mut());
         }
-        d.q_bytes.set(d.q_bytes.get().saturating_sub(h.size));
-        let hit = first_not(p, FREED_BYTE, h.size)
-            .or_else(|| first_not(p.add(h.size), CANARY_BYTE, TRAILER).map(|i| h.size + i));
+        d.q_bytes.set(d.q_bytes.get().saturating_sub(size));
+        let hit = first_not(p, FREED_BYTE, size)
+            .or_else(|| first_not(p.add(size), CANARY_BYTE, TRAILER).map(|i| size + i));
         if let Some(off) = hit {
             let mut v = Violation::new(ViolationKind::UseAfterFree, p.addr());
-            v.block_size = h.size;
-            v.block_align = h.align as usize;
+            v.block(&h);
             v.offset = off;
             report(&v);
         }
@@ -683,11 +864,13 @@ pub(crate) unsafe fn thread_done(hb: *mut crate::init::HeapBox) {
 ///
 /// # Safety
 /// `GlobalAlloc::dealloc` contract (which this checks).
+#[inline(never)]
 pub(crate) unsafe fn dealloc(p: *mut u8, layout: core::alloc::Layout) {
+    let st = here();
     // SAFETY: forwarded.
     unsafe {
-        if let Some(h) = validate(p, layout) {
-            release(p, h);
+        if let Some(h) = validate(p, layout, st) {
+            release(p, h, st);
         }
     }
 }
@@ -697,22 +880,25 @@ pub(crate) unsafe fn dealloc(p: *mut u8, layout: core::alloc::Layout) {
 ///
 /// # Safety
 /// `GlobalAlloc::realloc` contract (which this checks).
+#[inline(never)]
 pub(crate) unsafe fn realloc(p: *mut u8, layout: core::alloc::Layout, new_size: usize) -> *mut u8 {
+    let st = here();
     // SAFETY: forwarded; the copy stays inside both blocks.
     unsafe {
-        let Some(h) = validate(p, layout) else {
+        let Some(h) = validate(p, layout, st) else {
             return core::ptr::null_mut();
         };
         let nl = core::alloc::Layout::from_size_align_unchecked(new_size, layout.align());
-        let np = alloc(nl, false);
+        let np = alloc_at(nl, false, st);
         if np.is_null() {
             return np;
         }
-        core::ptr::copy_nonoverlapping(p, np, h.size.min(new_size));
+        let old = h.size as usize;
+        core::ptr::copy_nonoverlapping(p, np, old.min(new_size));
         if let Some(d) = thread_debug() {
-            count(d, |c| c.on_realloc(h.size, new_size));
+            count(d, |c| c.on_realloc(old, new_size));
         }
-        release(p, h);
+        release(p, h, st);
         np
     }
 }
@@ -734,6 +920,10 @@ pub struct Leak {
     /// with a number at or past a mark taken with [`alloc_seq`] were
     /// allocated after it.
     pub seq: u64,
+    /// Thread that allocated it (debug thread number, see [`thread_number`]).
+    pub thread: u32,
+    /// Where it was allocated ([`stack::frames`], [`stack::print_stack`]).
+    pub stack: StackId,
 }
 
 /// Totals of a [`leak_report`].
@@ -768,14 +958,17 @@ pub fn leak_report(f: &mut dyn FnMut(&Leak)) -> LeakSummary {
         // SAFETY: `block` is an allocated core block of `bsize` bytes, so its
         // first HDR bytes are readable.
         let (st, h) = unsafe { read_header(block.add(HDR)) };
-        if st == State::Live && HDR + h.size + TRAILER <= bsize {
+        let size = h.size as usize;
+        if st == State::Live && size <= bsize - HDR - TRAILER {
             sum.blocks += 1;
-            sum.bytes += h.size;
+            sum.bytes += size;
             f(&Leak {
                 ptr: block.addr() + HDR,
-                size: h.size,
+                size,
                 align: h.align as usize,
                 seq: h.seq,
+                thread: h.alloc_tid,
+                stack: StackId(h.alloc_stack),
             });
         }
         true
@@ -798,32 +991,54 @@ pub fn leak_report(f: &mut dyn FnMut(&Leak)) -> LeakSummary {
     sum
 }
 
-/// Print a leak summary and the first `max` leaks to the output hook.
+/// Most distinct call sites [`print_leaks`] groups; leaks from further sites
+/// are counted together.
+const LEAK_SITES: usize = 64;
+
+/// Print the leaks grouped by the call site that allocated them, largest
+/// first, as LeakSanitizer does: for each of the first `max` sites the line
+/// `rusty_alloc: leak of <bytes> bytes in <blocks> blocks allocated from:`
+/// and its stack, then the summary line
+/// `rusty_alloc: leaks: <blocks> blocks, <bytes> bytes still allocated`.
 pub fn print_leaks(max: usize) -> LeakSummary {
-    let mut n = 0;
+    let mut sites = [(StackId::NONE, 0usize, 0usize); LEAK_SITES];
+    let mut used = 0;
+    let mut other = (0usize, 0usize);
     let sum = leak_report(&mut |l| {
-        if n < max {
-            let mut b = Line::new();
-            let _ = fmt::write(
-                &mut b,
-                format_args!(
-                    "rusty_alloc: leak: {:#x} size {} align {} seq {}\n",
-                    l.ptr, l.size, l.align, l.seq
-                ),
-            );
-            crate::options::out_fmt(b.as_str());
+        if let Some(s) = sites[..used].iter_mut().find(|s| s.0 == l.stack) {
+            s.1 += 1;
+            s.2 += l.size;
+        } else if used < LEAK_SITES {
+            sites[used] = (l.stack, 1, l.size);
+            used += 1;
+        } else {
+            other.0 += 1;
+            other.1 += l.size;
         }
-        n += 1;
     });
-    let mut b = Line::new();
-    let _ = fmt::write(
-        &mut b,
-        format_args!(
-            "rusty_alloc: leaks: {} blocks, {} bytes still allocated\n",
-            sum.blocks, sum.bytes
-        ),
-    );
-    crate::options::out_fmt(b.as_str());
+    let sites = &mut sites[..used];
+    sites.sort_unstable_by(|a, b| b.2.cmp(&a.2).then(b.1.cmp(&a.1)));
+    for s in sites.iter().take(max) {
+        line(format_args!(
+            "rusty_alloc: leak of {} bytes in {} blocks allocated from:\n",
+            s.2, s.1
+        ));
+        stack::print_stack(s.0);
+    }
+    for s in sites.iter().skip(max) {
+        other.0 += s.1;
+        other.1 += s.2;
+    }
+    if other.0 > 0 {
+        line(format_args!(
+            "rusty_alloc: leak of {} bytes in {} blocks from further call sites\n",
+            other.1, other.0
+        ));
+    }
+    line(format_args!(
+        "rusty_alloc: leaks: {} blocks, {} bytes still allocated\n",
+        sum.blocks, sum.bytes
+    ));
     sum
 }
 

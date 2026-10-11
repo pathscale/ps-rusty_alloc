@@ -64,6 +64,10 @@ pub struct Segment {
     /// the M8 P0. (OS-released memory is unmapped, so this only bites the
     /// arena path, which is exactly why "arenas off" was the one clean arm.)
     pub guarded: bool,
+    /// ps: state this chunk was left in when it went back to its arena, read
+    /// by the NEXT tenant before the header is rewritten. See
+    /// `RESIDENT_FREE_BUDGET`.
+    pub ps_free_state: u8,
     /// Next segment in the owning heap's list (reused as the global
     /// abandoned-list link while abandoned).
     pub next: *mut Segment,
@@ -434,8 +438,22 @@ pub fn segment_alloc(arena_id: i32) -> Result<*mut Segment, PrimError> {
         // bump cursor first carves it (`span_alloc`). Every scalar field is
         // assigned below.
         if !mem_zero {
+            // ps: settle what the previous tenant left (see park_or_purge).
+            match (*seg).ps_free_state {
+                FREE_STATE_RESIDENT => {
+                    FREE_RESIDENT.fetch_sub(1, Ordering::Relaxed);
+                }
+                FREE_STATE_PURGED_RECOMMIT => {
+                    let base = ptr_.add(HEADER_SLICES * SEGMENT_SLICE_SIZE);
+                    if os::commit(base, SEGMENT_SIZE - HEADER_SLICES * SEGMENT_SLICE_SIZE).is_err() {
+                        crate::stats::commit_failed();
+                    }
+                }
+                _ => {}
+            }
             scrub_recycled(seg, HEADER_SLICES, true);
         }
+        (*seg).ps_free_state = FREE_STATE_NONE;
         (*seg).kind = SegmentKind::Normal;
         (*seg).total_size = size;
         (*seg).next_free_slice = HEADER_SLICES as u32;
@@ -449,6 +467,53 @@ pub fn segment_alloc(arena_id: i32) -> Result<*mut Segment, PrimError> {
     }
     segment_map::register(seg);
     Ok(seg)
+}
+
+/// ps: how many freed-but-resident chunks the arenas may hold, process-wide.
+///
+/// A Normal segment that empties goes back to its arena with every page its
+/// tenant ever touched still resident (arena memory is handed out as-is), and
+/// the next tenant touches a different subset, so the resident set of a
+/// process that churns threads is the UNION of every layout any tenant ever
+/// used (workers:16 grew ~20 MB per wave of 16 threads, 515 to 641 MB, with
+/// zero abandoned segments and one live chunk between waves).
+///
+/// Reactive bound, no timer: the free path itself checks the backlog. Up to
+/// this many freed chunks stay resident (cheap, warm reuse); a free beyond it
+/// purges the touched range of that chunk on the spot. The same shape as a
+/// retire queue that sweeps only once its backlog passes a trigger.
+const RESIDENT_FREE_BUDGET: usize = 2;
+const FREE_STATE_NONE: u8 = 0;
+const FREE_STATE_RESIDENT: u8 = 1;
+const FREE_STATE_PURGED_RECOMMIT: u8 = 2;
+static FREE_RESIDENT: AtomicUsize = AtomicUsize::new(0);
+
+/// ps: on the way back to an arena, either count the chunk against the
+/// resident budget or purge what its tenant touched.
+///
+/// # Safety
+/// `seg` is an empty, restored Normal segment about to be freed to an arena.
+unsafe fn park_or_purge(seg: *mut Segment) {
+    // SAFETY: per contract; header slice is never purged, so the state byte
+    // survives for the next tenant.
+    unsafe {
+        if FREE_RESIDENT.fetch_add(1, Ordering::Relaxed) < RESIDENT_FREE_BUDGET {
+            (*seg).ps_free_state = FREE_STATE_RESIDENT;
+            return;
+        }
+        FREE_RESIDENT.fetch_sub(1, Ordering::Relaxed);
+        (*seg).ps_free_state = FREE_STATE_NONE;
+        let hw = (*seg).next_free_slice as usize;
+        if hw > HEADER_SLICES {
+            let base = seg.cast::<u8>().add(HEADER_SLICES * SEGMENT_SLICE_SIZE);
+            let bytes = (hw - HEADER_SLICES) * SEGMENT_SLICE_SIZE;
+            if let Ok(recommit) = os::purge(base, bytes, crate::options::is_enabled(5)) {
+                if recommit {
+                    (*seg).ps_free_state = FREE_STATE_PURGED_RECOMMIT;
+                }
+            }
+        }
+    }
 }
 
 /// Make a dead segment's memory fit for a next tenant: lift guard-page
@@ -499,8 +564,12 @@ pub unsafe fn segment_free(seg: *mut Segment) -> Result<(), PrimError> {
         if crate::arena::owns(seg.cast()) {
             return Ok(());
         }
-    } else if crate::arena::chunk_free(seg.cast()) {
-        return Ok(());
+    } else if crate::arena::owns(seg.cast()) {
+        // SAFETY: empty, restored, about to be handed to its arena.
+        unsafe { park_or_purge(seg) };
+        if crate::arena::chunk_free(seg.cast()) {
+            return Ok(());
+        }
     }
     // wasm: the slice pool is the free list (F2) — `expose_provenance` so a
     // later `reserve_backing` may reconstruct a pointer to this range.

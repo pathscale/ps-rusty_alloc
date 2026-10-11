@@ -365,9 +365,15 @@ fn ensure_init_slow() {
     //
     // `target_os = "unknown"` and not `target_arch` alone: wasm32-wasip1 does
     // have an environment and keeps the pass.
-    #[cfg(all(
-        feature = "std",
-        not(all(target_arch = "wasm32", target_os = "unknown"))
+    //
+    // Without `std` on unix the pass runs too: it reads through `prim::getenv`
+    // (and `environ` on Linux) into stack buffers, which never needed `std`.
+    #[cfg(any(
+        all(
+            feature = "std",
+            not(all(target_arch = "wasm32", target_os = "unknown"))
+        ),
+        all(unix, not(miri))
     ))]
     env::pass();
 }
@@ -388,9 +394,12 @@ fn ensure_init_slow() {
 /// `getenv` / `GetEnvironmentVariableA` that upstream's prim calls — and the
 /// parse reads the bytes in place. Zero allocations, and
 /// `crates/rusty_alloc_api/tests/reentrancy.rs` fails if one comes back.
-#[cfg(all(
-    feature = "std",
-    not(all(target_arch = "wasm32", target_os = "unknown"))
+#[cfg(any(
+    all(
+        feature = "std",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ),
+    all(unix, not(miri))
 ))]
 mod env {
     use core::sync::atomic::Ordering;

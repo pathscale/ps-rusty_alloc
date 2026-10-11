@@ -53,3 +53,22 @@ bun fixtures.ts --regen  # rewrite the expected output after an intended change
 The output is one `key: value` line per check and holds no addresses; a
 mismatch lists each missing, extra or changed key. See
 [docs/debugging.md](../docs/debugging.md).
+
+## no_std, multi-threaded
+
+`nostd-mt/` is a standalone `#![no_std]` `#![no_main]` binary with this fork as
+its global allocator, 128 pthreads over 8 rounds, cross-thread frees and frees
+after the owner thread has exited. `nostd.ts` builds it four ways
+(`panic = "abort"`, debug assertions, `debug_checks`, `panic = "unwind"` on
+nightly), runs each 50 times against `fixtures/nostd_mt.expected`, checks each
+binary with `nostd-nm.ts` for std symbols, and checks that the `debug_checks`
+build stops a double free on a spawned thread.
+
+```sh
+bun nostd.ts              # all four builds, 50 runs each
+bun nostd.ts --runs 200   # more runs
+bun nostd.ts --regen      # rewrite the expected output after an intended change
+bun nostd-nm.ts <binary>  # the std-symbol check alone
+```
+
+See [docs/no_std.md](../docs/no_std.md).

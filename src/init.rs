@@ -787,6 +787,12 @@ pub unsafe fn thread_done(hb: *mut HeapBox) {
     // SAFETY: per contract `hb` is this thread's live box; `owner_tid` is a
     // plain field.
     let tid = unsafe { (*hb).owner_tid };
+    // Debug mode: release the quarantine while the heap can still free.
+    #[cfg(feature = "debug_checks")]
+    // SAFETY: per contract `hb` is this thread's live box.
+    unsafe {
+        crate::debug::thread_done(hb);
+    }
     // SAFETY: per contract we are the owner and this runs exactly once;
     // sequencing per the model.
     unsafe { thread_done_one(hb) };

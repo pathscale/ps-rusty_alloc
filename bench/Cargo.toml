@@ -27,6 +27,18 @@ smalloc = ["dep:smmalloc"]
 baby_mimalloc = ["dep:baby-mimalloc"]
 rlsf = ["dep:rlsf"]
 dlmalloc = ["dep:dlmalloc"]
+# This fork with its debug layer on (`debug_checks`): bin/debug for overhead
+# runs, and the `debug_demo` fixture program.
+debug = ["rusty_alloc", "rusty_alloc/debug_checks"]
+
+[[bin]]
+name = "ps-rusty_alloc-bench"
+path = "src/main.rs"
+
+[[bin]]
+name = "debug_demo"
+path = "src/bin/debug_demo.rs"
+required-features = ["debug"]
 
 [profile.release]
 opt-level = 3

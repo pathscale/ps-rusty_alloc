@@ -38,3 +38,18 @@ Output: `results/<tag>-raw-<time>.jsonl` (one line per process) and
 
 Hooks: `BENCH_WAVE_RSS=1` and `BENCH_PROFILE_SLEEP_MS`, see
 [docs/debugging.md](../docs/debugging.md#added-in-this-fork).
+
+## Debug mode
+
+Feature `debug` builds this fork with its debug layer on (`debug_checks`):
+`bun build.ts debug` makes `bin/debug` for overhead runs against `bin/rusty_alloc`,
+and the `debug_demo` program triggers every check once.
+
+```sh
+bun fixtures.ts          # build and run debug_demo, compare with fixtures/debug_demo.expected
+bun fixtures.ts --regen  # rewrite the expected output after an intended change
+```
+
+The output is one `key: value` line per check and holds no addresses; a
+mismatch lists each missing, extra or changed key. See
+[docs/debugging.md](../docs/debugging.md).

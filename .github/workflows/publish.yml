@@ -22,7 +22,10 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
       - run: cargo build --release
-      # no_std is single-threaded only and needs the explicit opt-in (see src/lib.rs).
+      # no_std on unix: multi-threaded, no cfg needed (docs/no_std.md).
+      - run: cargo check --no-default-features
+      - run: cargo check --no-default-features --features debug_checks
+      # The explicit single-thread opt-in still builds.
       - run: cargo check --no-default-features
         env:
           RUSTFLAGS: --cfg ra_single_threaded

@@ -132,14 +132,13 @@ impl Violation {
     /// Take the block's recorded size, alignment, number and call sites.
     const fn block(&mut self, h: &Header) {
         self.block_size = h.size as usize;
-        self.block_align = h.align as usize;
+        self.block_align = h.align();
+        self.seq = h.seq;
         self.alloc_stack = StackId(h.alloc_stack);
         self.alloc_thread = h.alloc_tid;
         if h.state == FREED {
             self.free_stack = StackId(h.free_stack);
             self.free_thread = h.free_tid;
-        } else {
-            self.seq = h.seq;
         }
     }
 }
@@ -439,11 +438,11 @@ pub fn capture() -> StackId {
 }
 
 // ---------------------------------------------------------------------------
-// Block layout: [header 48 B][user size B][canary 8 B]
+// Block layout: [header 64 B][user size B][canary 8 B]
 // ---------------------------------------------------------------------------
 
 /// Header bytes in front of every debug block.
-const HDR: usize = 48;
+const HDR: usize = 64;
 /// Canary bytes after every debug block.
 const TRAILER: usize = 8;
 /// Fill of a fresh, non-zeroed allocation (mimalloc's `MI_DEBUG_UNINIT`).
@@ -456,11 +455,14 @@ pub const CANARY_BYTE: u8 = 0xDE;
 const LIVE: u32 = 0x4c49_5645;
 const FREED: u32 = 0x4652_4545;
 
-/// The header. `seq` doubles as the quarantine link once the block is freed,
-/// which is why a FREED header's checksum leaves it out.
+/// The header. A live block is linked into its registry shard through
+/// `prev`/`next`; a freed one into its thread's quarantine through `next`,
+/// which is why a FREED header's checksum leaves the links out.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Header {
+    prev: *mut u8,
+    next: *mut u8,
     seq: u64,
     size: u64,
     alloc_stack: u32,
@@ -468,15 +470,19 @@ struct Header {
     alloc_tid: u32,
     free_tid: u32,
     state: u32,
-    align: u32,
+    align_log2: u16,
+    /// Registry shard epoch the block was linked in (see [`Shard`]).
+    epoch: u16,
     check: u64,
 }
 
-const _: () = assert!(core::mem::size_of::<Header>() == HDR);
+const _: () = assert!(core::mem::size_of::<Header>() <= HDR);
 
 impl Header {
     const fn live(seq: u64, size: usize, align: usize, stack: StackId, tid: u32) -> Self {
         Self {
+            prev: core::ptr::null_mut(),
+            next: core::ptr::null_mut(),
             seq,
             size: size as u64,
             alloc_stack: stack.0,
@@ -484,24 +490,35 @@ impl Header {
             alloc_tid: tid,
             free_tid: 0,
             state: LIVE,
-            align: align as u32,
+            align_log2: align.trailing_zeros() as u16,
+            epoch: 0,
             check: 0,
         }
+    }
+
+    const fn align(&self) -> usize {
+        1usize << (self.align_log2 & 63)
     }
 }
 
 /// Header checksum, keyed by the block address so a header copied or left
 /// behind at another address does not validate (Scudo's chunk checksum).
-const fn checksum(user: usize, h: &Header) -> u64 {
-    let seq = if h.state == FREED { 0 } else { h.seq };
+fn checksum(user: usize, h: &Header) -> u64 {
+    let links = if h.state == FREED {
+        0
+    } else {
+        (h.prev.addr() as u64).rotate_left(17) ^ h.next.addr() as u64
+    };
     let mut x = (user as u64) ^ 0x7275_7374_795f_6462;
-    x = (x ^ seq).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ h.seq).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     x = (x ^ h.size).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    x = (x ^ (((h.align as u64) << 32) | h.state as u64)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    x = (x ^ (((h.alloc_stack as u64) << 32) | h.free_stack as u64))
+    x = (x ^ ((u64::from(h.align_log2) << 48) | (u64::from(h.epoch) << 32) | u64::from(h.state)))
+        .wrapping_mul(0x94D0_49BB_1331_11EB);
+    x = (x ^ ((u64::from(h.alloc_stack) << 32) | u64::from(h.free_stack)))
         .wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    x = (x ^ (((h.alloc_tid as u64) << 32) | h.free_tid as u64))
+    x = (x ^ ((u64::from(h.alloc_tid) << 32) | u64::from(h.free_tid)))
         .wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ links).wrapping_mul(0x94D0_49BB_1331_11EB);
     x ^ (x >> 31)
 }
 
@@ -562,6 +579,209 @@ unsafe fn first_not(p: *const u8, b: u8, n: usize) -> Option<usize> {
     // SAFETY: per contract.
     let s = unsafe { core::slice::from_raw_parts(p, n) };
     s.iter().position(|&x| x != b)
+}
+
+// ---------------------------------------------------------------------------
+// Live-block registry
+// ---------------------------------------------------------------------------
+//
+// Every live debug block, from every thread, is on one of `SHARDS` doubly
+// linked lists threaded through the block headers and picked by address,
+// each under its own lock: the busy list of Windows PageHeap, Valgrind's
+// table of live blocks. A leak report walks the lists and so sees every
+// thread's blocks, live threads and exited ones alike, without stopping any
+// thread and without touching the core allocator's page lists, which their
+// owners change without locks. A block is linked before `alloc` returns it
+// and unlinked, under the same lock, before it is poisoned and quarantined,
+// so the walk only ever reads headers of live, allocated blocks. Links are
+// covered by the header checksum, and a link is followed only out of a
+// header that validates, so a header damaged by the program ends the walk
+// of its shard instead of sending it into freed or unmapped memory.
+
+const SHARDS: usize = 256;
+
+/// One registry list. `epoch` restarts the list when a damaged neighbor
+/// makes it unsafe to keep: blocks of an older epoch are no longer on it and
+/// are unlinked without touching anything.
+#[repr(align(64))]
+struct Shard {
+    lock: core::sync::atomic::AtomicBool,
+    /// Holder of `lock` (`init::thread_id`), to catch re-entry.
+    owner: core::sync::atomic::AtomicUsize,
+    head: core::cell::Cell<*mut u8>,
+    count: core::cell::Cell<usize>,
+    epoch: core::cell::Cell<u16>,
+    /// Blocks dropped from the list by restarts.
+    lost: core::cell::Cell<usize>,
+}
+
+// SAFETY: every `Cell` is touched only by the holder of `lock`.
+unsafe impl Sync for Shard {}
+
+impl Shard {
+    const fn new() -> Self {
+        Self {
+            lock: core::sync::atomic::AtomicBool::new(false),
+            owner: core::sync::atomic::AtomicUsize::new(0),
+            head: core::cell::Cell::new(core::ptr::null_mut()),
+            count: core::cell::Cell::new(0),
+            epoch: core::cell::Cell::new(0),
+            lost: core::cell::Cell::new(0),
+        }
+    }
+
+    fn lock(&self) {
+        let me = crate::init::thread_id();
+        while self
+            .lock
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            if self.owner.load(Ordering::Relaxed) == me {
+                // A `leak_report` visitor called into the allocator.
+                crate::options::out_fmt(
+                    "rusty_alloc: error: the leak_report visitor allocated or freed; it must not\n",
+                );
+                crate::abort();
+            }
+            core::hint::spin_loop();
+        }
+        self.owner.store(me, Ordering::Relaxed);
+    }
+
+    fn unlock(&self) {
+        self.owner.store(0, Ordering::Relaxed);
+        self.lock.store(false, Ordering::Release);
+    }
+
+    /// Drop every block from the list (lock held).
+    fn restart(&self) {
+        self.lost.set(self.lost.get() + self.count.get());
+        self.count.set(0);
+        self.head.set(core::ptr::null_mut());
+        self.epoch.set(self.epoch.get().wrapping_add(1));
+    }
+}
+
+#[allow(
+    clippy::declare_interior_mutable_const,
+    reason = "array initialiser only"
+)]
+const SHARD: Shard = Shard::new();
+static REGISTRY: [Shard; SHARDS] = [SHARD; SHARDS];
+
+fn shard_of(user: *mut u8) -> &'static Shard {
+    let h = ((user.addr() >> 4) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    &REGISTRY[(h >> 56) as usize % SHARDS]
+}
+
+/// Read a header under its shard's lock, so that no neighbor update is
+/// half-written.
+///
+/// # Safety
+/// As [`read_header`].
+unsafe fn locked_read(user: *mut u8) -> (State, Header) {
+    let s = shard_of(user);
+    s.lock();
+    // SAFETY: per contract.
+    let r = unsafe { read_header(user) };
+    s.unlock();
+    r
+}
+
+/// Point a neighbor's `prev` or `next` at `to` (lock held). False when the
+/// neighbor's header does not validate as a block of this list.
+///
+/// # Safety
+/// `nb` is null or a block reached through a validated link of `s`.
+unsafe fn relink(s: &Shard, nb: *mut u8, set_prev: bool, to: *mut u8) -> bool {
+    if nb.is_null() {
+        return true;
+    }
+    // SAFETY: per contract `nb` is a live block on this list.
+    unsafe {
+        let (st, mut h) = read_header(nb);
+        if st != State::Live || h.epoch != s.epoch.get() {
+            return false;
+        }
+        if set_prev {
+            h.prev = to;
+        } else {
+            h.next = to;
+        }
+        write_header(nb, h);
+    }
+    true
+}
+
+/// Link a new block in and write its header.
+///
+/// # Safety
+/// `user` is a fresh debug block, not yet visible to anyone.
+unsafe fn track(user: *mut u8, mut h: Header) {
+    let s = shard_of(user);
+    s.lock();
+    let head = s.head.get();
+    // SAFETY: `head` is the list head, a live block of this list.
+    let ok = unsafe { relink(s, head, true, user) };
+    if !ok {
+        s.restart();
+    }
+    h.prev = core::ptr::null_mut();
+    h.next = s.head.get();
+    h.epoch = s.epoch.get();
+    // SAFETY: per contract.
+    unsafe { write_header(user, h) };
+    s.head.set(user);
+    s.count.set(s.count.get() + 1);
+    s.unlock();
+    if !ok {
+        report(&Violation::new(ViolationKind::CorruptHeader, head.addr()));
+    }
+}
+
+/// Unlink a live block and write its FREED header `fh`, in one step under
+/// the lock, so a racing second free sees FREED. `Err` with what the header
+/// holds now when it is no longer the live block `seq` (freed meanwhile, or
+/// damaged).
+///
+/// # Safety
+/// `user` passed [`validate`].
+unsafe fn untrack(user: *mut u8, seq: u64, fh: Header) -> Result<(), (State, Header)> {
+    let s = shard_of(user);
+    s.lock();
+    // SAFETY: per contract the block is ours; neighbors are reached only
+    // through its validated links.
+    let bad = unsafe {
+        let (st, h) = read_header(user);
+        if st != State::Live || h.seq != seq {
+            s.unlock();
+            return Err((st, h));
+        }
+        let mut bad = core::ptr::null_mut();
+        if h.epoch == s.epoch.get() {
+            let ok_prev = if h.prev.is_null() {
+                s.head.set(h.next);
+                true
+            } else {
+                relink(s, h.prev, false, h.next)
+            };
+            let ok_next = relink(s, h.next, true, h.prev);
+            if !ok_prev || !ok_next {
+                bad = if ok_prev { h.next } else { h.prev };
+                s.restart();
+            } else {
+                s.count.set(s.count.get().saturating_sub(1));
+            }
+        }
+        write_header(user, fh);
+        bad
+    };
+    s.unlock();
+    if !bad.is_null() {
+        report(&Violation::new(ViolationKind::CorruptHeader, bad.addr()));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -633,7 +853,7 @@ unsafe fn alloc_at(layout: core::alloc::Layout, zero: bool, st: StackId) -> *mut
             d.seq.set(s);
             (s, thread_no(d))
         });
-        write_header(user, Header::live(seq, size, align, st, tid));
+        track(user, Header::live(seq, size, align, st, tid));
         user
     }
 }
@@ -672,8 +892,8 @@ unsafe fn validate(p: *mut u8, layout: core::alloc::Layout, st: StackId) -> Opti
             report(&v);
             return None;
         }
-        let (st, h) = read_header(p);
-        match st {
+        let (state, h) = locked_read(p);
+        match state {
             State::Live => {}
             State::Freed => {
                 v.kind = ViolationKind::DoubleFree;
@@ -686,7 +906,7 @@ unsafe fn validate(p: *mut u8, layout: core::alloc::Layout, st: StackId) -> Opti
                 // block (every block with align <= 16) tells an interior
                 // pointer from a damaged header.
                 let u = start.add(HDR);
-                let (ust, uh) = read_header(u);
+                let (ust, uh) = locked_read(u);
                 if off == HDR {
                     v.kind = ViolationKind::CorruptHeader;
                 } else if ust == State::Bad {
@@ -705,7 +925,7 @@ unsafe fn validate(p: *mut u8, layout: core::alloc::Layout, st: StackId) -> Opti
         if h.size as usize != layout.size() {
             v.kind = ViolationKind::SizeMismatch;
             report(&v);
-        } else if h.align as usize != layout.align() {
+        } else if h.align() != layout.align() {
             v.kind = ViolationKind::AlignMismatch;
             report(&v);
         }
@@ -759,41 +979,82 @@ pub fn quarantine_limit() -> usize {
     l
 }
 
-/// Hand a validated block back: poison it, record where it was freed, and
-/// park it in this thread's quarantine, releasing the oldest blocks past the
-/// budget.
+/// Hand the core block under a debug block back to the core.
+///
+/// # Safety
+/// `p` is a debug block that is unlinked and owned by the caller.
+unsafe fn core_free(p: *mut u8) {
+    // SAFETY: per contract; the core block start frees the whole block, also
+    // when the block was placed at an offset for its alignment.
+    unsafe { crate::alloc::free(block_start(p).unwrap_or_else(|| p.sub(HDR))) };
+}
+
+/// Hand a validated block back: unlink it, record where it was freed,
+/// poison it and park it in this thread's quarantine, releasing the oldest
+/// blocks past the budget.
 ///
 /// # Safety
 /// `p` passed [`validate`], which returned `h`.
 unsafe fn release(p: *mut u8, h: Header, st: StackId) {
     let size = h.size as usize;
+    let d = thread_debug();
+    let mut fh = h;
+    fh.state = FREED;
+    fh.prev = core::ptr::null_mut();
+    fh.next = core::ptr::null_mut();
+    fh.free_stack = st.0;
+    fh.free_tid = d.map_or(0, thread_no);
     // SAFETY: per contract the block is ours and live until handed on.
     unsafe {
+        if let Err((state, now)) = untrack(p, h.seq, fh) {
+            // Freed (or damaged) by another thread since `validate`.
+            let mut v = Violation::new(
+                if state == State::Freed {
+                    ViolationKind::DoubleFree
+                } else {
+                    ViolationKind::CorruptHeader
+                },
+                p.addr(),
+            );
+            v.stack = st;
+            if state == State::Freed {
+                v.block(&now);
+            }
+            report(&v);
+            return;
+        }
         core::ptr::write_bytes(p, FREED_BYTE, size);
-        let d = thread_debug();
-        let mut fh = h;
-        fh.state = FREED;
-        fh.seq = 0;
-        fh.free_stack = st.0;
-        fh.free_tid = d.map_or(0, thread_no);
-        write_header(p, fh);
         if let Some(d) = d {
             count(d, |c| c.on_free(size));
         }
         let limit = quarantine_limit();
         let Some(d) = d.filter(|_| size <= limit) else {
-            crate::alloc::free(p.sub(HDR));
+            core_free(p);
             return;
         };
         let tail = d.q_tail.get();
         if tail.is_null() {
             d.q_head.set(p);
         } else {
-            tail.sub(HDR).cast::<*mut u8>().write_unaligned(p);
+            set_q_next(tail, p);
         }
         d.q_tail.set(p);
         d.q_bytes.set(d.q_bytes.get() + size);
         while d.q_bytes.get() > limit && evict_one(d) {}
+    }
+}
+
+/// Set the quarantine link of a FREED block (outside its checksum).
+///
+/// # Safety
+/// `p` is a FREED block in the calling thread's quarantine.
+unsafe fn set_q_next(p: *mut u8, next: *mut u8) {
+    // SAFETY: per contract; the field lies inside the header.
+    unsafe {
+        p.sub(HDR)
+            .add(core::mem::offset_of!(Header, next))
+            .cast::<*mut u8>()
+            .write_unaligned(next);
     }
 }
 
@@ -819,11 +1080,8 @@ fn evict_one(d: &ThreadDebug) -> bool {
             return true;
         }
         let size = h.size as usize;
-        // The link lives in the header's `seq` word, outside the checksum of
-        // a FREED header.
-        let next = p.sub(HDR).cast::<*mut u8>().read_unaligned();
-        d.q_head.set(next);
-        if next.is_null() {
+        d.q_head.set(h.next);
+        if h.next.is_null() {
             d.q_tail.set(core::ptr::null_mut());
         }
         d.q_bytes.set(d.q_bytes.get().saturating_sub(size));
@@ -835,7 +1093,7 @@ fn evict_one(d: &ThreadDebug) -> bool {
             v.offset = off;
             report(&v);
         }
-        crate::alloc::free(p.sub(HDR));
+        core_free(p);
     }
     true
 }
@@ -917,8 +1175,8 @@ pub struct Leak {
     /// Requested alignment.
     pub align: usize,
     /// Allocation number on the allocating thread, counted from 1: blocks
-    /// with a number at or past a mark taken with [`alloc_seq`] were
-    /// allocated after it.
+    /// with a number at or past a mark taken with [`alloc_seq`] on that
+    /// thread were allocated after it.
     pub seq: u64,
     /// Thread that allocated it (debug thread number, see [`thread_number`]).
     pub thread: u32,
@@ -929,65 +1187,64 @@ pub struct Leak {
 /// Totals of a [`leak_report`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LeakSummary {
-    /// Live blocks.
+    /// Live blocks listed.
     pub blocks: usize,
     /// Their requested bytes.
     pub bytes: usize,
+    /// Live blocks that could not be listed: on a registry list behind a
+    /// header the program damaged, or dropped from a list restarted after
+    /// such damage (reported as `CorruptHeader` when a free or allocation
+    /// met it). 0 in a clean run.
+    pub unlisted: usize,
 }
 
 /// The calling thread's allocation number so far: a mark for
-/// [`leak_report`] (blocks with `seq > mark` came later).
+/// [`leak_report`] (its blocks with `seq > mark` came later).
 pub fn alloc_seq() -> u64 {
     thread_debug().map_or(0, |d| d.seq.get())
 }
 
-/// Every live `RustyAlloc` block of the calling thread's heap and of the
-/// segments abandoned by exited threads, each handed to `f`. Blocks in the
-/// quarantine are freed and not listed. Built on `Heap::visit_blocks`, like
-/// `mi_heap_visit_blocks`; `f` must not allocate.
+/// Every live debug block in the process, from every thread (running or
+/// exited), each handed to `f`, with its allocation call site. Blocks in a
+/// quarantine are freed and not listed.
 ///
-/// Not listed: blocks owned by other live threads (call it on each thread),
-/// and over-aligned blocks (align > 16) that the core placed at an offset
-/// inside its block.
+/// Walks the live-block registry one shard at a time, each under its lock,
+/// so it runs while other threads allocate and free: a block allocated or
+/// freed during the walk may or may not be listed, every block live for the
+/// whole walk is listed once, and only headers of live blocks are read.
+/// LeakSanitizer stops the world for this; without `std` there is no way to,
+/// and none is needed. `f` runs under a shard lock and must not allocate or
+/// free through this allocator (that is caught and aborts).
 pub fn leak_report(f: &mut dyn FnMut(&Leak)) -> LeakSummary {
     let mut sum = LeakSummary::default();
-    let mut visit = |_: &crate::heap::AreaInfo, block: *mut u8, bsize: usize| -> bool {
-        if block.is_null() || bsize < HDR + TRAILER {
-            return true;
-        }
-        // SAFETY: `block` is an allocated core block of `bsize` bytes, so its
-        // first HDR bytes are readable.
-        let (st, h) = unsafe { read_header(block.add(HDR)) };
-        let size = h.size as usize;
-        if st == State::Live && size <= bsize - HDR - TRAILER {
+    for s in &REGISTRY {
+        s.lock();
+        let ep = s.epoch.get();
+        let mut cur = s.head.get();
+        let mut seen = 0;
+        while !cur.is_null() {
+            // SAFETY: `cur` is the head or came from a validated link of
+            // this list, under its lock: a live, allocated block.
+            let (st, h) = unsafe { read_header(cur) };
+            if st != State::Live || h.epoch != ep {
+                break;
+            }
+            seen += 1;
             sum.blocks += 1;
-            sum.bytes += size;
+            sum.bytes += h.size as usize;
             f(&Leak {
-                ptr: block.addr() + HDR,
-                size,
-                align: h.align as usize,
+                ptr: cur.addr(),
+                size: h.size as usize,
+                align: h.align(),
                 seq: h.seq,
                 thread: h.alloc_tid,
                 stack: StackId(h.alloc_stack),
             });
+            cur = h.next;
         }
-        true
-    };
-    let hb = crate::init::heap_box();
-    if !hb.is_null() && hb != crate::init::empty_heap_box_ptr() {
-        // SAFETY: the calling thread's own live heap; the visitor neither
-        // allocates nor frees.
-        unsafe {
-            (*(*hb).heap.get()).visit_blocks(true, &mut visit);
-        }
+        sum.unlisted += s.lost.get() + s.count.get().saturating_sub(seen);
+        s.unlock();
     }
-    let sp = if hb.is_null() {
-        0
-    } else {
-        // SAFETY: a heap box (or the sentinel) is always readable.
-        unsafe { (*hb).subproc.load(Ordering::Relaxed) }
-    };
-    crate::init::abandoned_visit_blocks(sp, -1, true, &mut visit);
     sum
 }
 
@@ -1033,6 +1290,12 @@ pub fn print_leaks(max: usize) -> LeakSummary {
         line(format_args!(
             "rusty_alloc: leak of {} bytes in {} blocks from further call sites\n",
             other.1, other.0
+        ));
+    }
+    if sum.unlisted > 0 {
+        line(format_args!(
+            "rusty_alloc: {} live blocks not listed (their registry list was restarted after a corrupted header)\n",
+            sum.unlisted
         ));
     }
     line(format_args!(

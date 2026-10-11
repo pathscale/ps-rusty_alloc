@@ -36,7 +36,7 @@ categories = [
     "development-tools",
 ]
 license = "MIT"
-repository = "https://github.com/remade-with-rust/rusty_alloc"
+repository = "https://github.com/pathscale/ps-rusty_alloc"
 resolver = "2"
 publish = false
 exclude = ["bench"]

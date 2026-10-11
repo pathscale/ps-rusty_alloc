@@ -1,0 +1,35 @@
+[package]
+name = "ps-rusty_alloc-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Standalone: not part of the library package or its deps.
+[workspace]
+
+# One binary per allocator, chosen by feature (see build.ts).
+# mimalloc (C) is the reference baseline ONLY and exists only in this crate.
+
+[dependencies]
+rusty_alloc = { package = "ps-rusty_alloc", path = "..", optional = true }
+mimalloc = { version = "0.1.52", optional = true, default-features = false }
+smmalloc = { version = "7.6.13", optional = true }
+baby-mimalloc = { version = "0.2.1", optional = true, features = ["mmap", "spin_mutex"] }
+rlsf = { version = "0.2.3", optional = true }
+dlmalloc = { version = "0.2.14", optional = true, features = ["global"] }
+
+[features]
+system = []
+mimalloc = ["dep:mimalloc"]
+rusty_alloc = ["dep:rusty_alloc"]
+smalloc = ["dep:smmalloc"]
+baby_mimalloc = ["dep:baby-mimalloc"]
+rlsf = ["dep:rlsf"]
+dlmalloc = ["dep:dlmalloc"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false

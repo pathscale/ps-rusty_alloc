@@ -7,11 +7,24 @@ double_free: double_free size=40 align=8 block_size=40 block_align=8 offset=0
 size_mismatch: size_mismatch size=48 align=8 block_size=64 block_align=8 offset=0
 align_mismatch: align_mismatch size=64 align=16 block_size=64 block_align=8 offset=0
 foreign_pointer: foreign_pointer size=32 align=8 block_size=0 block_align=0 offset=0
-not_from_global_alloc: not_from_global_alloc size=32 align=8 block_size=0 block_align=0 offset=0
+not_from_global_alloc: not_from_global_alloc size=32 align=8 block_size=32 block_align=16 offset=0
 interior_pointer: interior_pointer size=48 align=8 block_size=64 block_align=8 offset=16
 corrupt_header: corrupt_header size=64 align=8 block_size=0 block_align=0 offset=0
 use_after_free: use_after_free size=0 align=0 block_size=48 block_align=8 offset=8
 realloc_stale_write: use_after_free size=0 align=0 block_size=16 block_align=8 offset=0
+sites_double_free: double_free alloc=debug_demo::site_alloc free=debug_demo::site_free found=debug_demo::site_free_again same_thread=true
+sites_use_after_free: use_after_free alloc=debug_demo::site_alloc free=debug_demo::site_free found=debug_demo::site_flush same_thread=true
+sites_buffer_overflow: buffer_overflow alloc=debug_demo::site_alloc free=none found=debug_demo::site_free same_thread=true
+raw_clean: none
+raw_usable_size: 13
+raw_double_free: double_free size=0 align=0 block_size=40 block_align=16 offset=0
+raw_foreign_pointer: foreign_pointer size=0 align=0 block_size=0 block_align=0 offset=0
+raw_interior_pointer: interior_pointer size=0 align=0 block_size=64 block_align=16 offset=16
+raw_buffer_overflow: buffer_overflow size=0 align=0 block_size=24 block_align=16 offset=24
+raw_use_after_free: use_after_free size=0 align=0 block_size=48 block_align=16 offset=8
+raw_realloc_stale_write: use_after_free size=0 align=0 block_size=16 block_align=16 offset=0
+raw_free_of_global_alloc: none
+sites_raw_double_free: double_free alloc=debug_demo::raw_site_alloc free=debug_demo::raw_site_free found=debug_demo::raw_site_free_again same_thread=true
 stats_bin_40: block_size=48 allocs=1000 frees=500 live_bytes=20000 waste_bytes=4000
 stats_realloc: reallocs=6 grows=5 shrinks=1 small_grows=3 ping_pongs=2
 stats_huge: allocs=2 frees=2 same_size_repeats=1
@@ -20,8 +33,10 @@ fragmentation_consistent: true
 stats_exited_thread: allocs=10 frees=10
 leaks_after_mark: [10, 200, 5000]
 leak_summary_counts_them: true
+leak_live_thread: size=321 other_thread=true site=debug_demo::leak_in_thread
+leaks_live_threads: sizes=[1111, 2222, 3333] threads=3 sites=debug_demo::leak_in_worker debug_demo::leak_in_worker debug_demo::leak_in_worker
 at_exit_report: true
 guarded_overflow_faults: true
 default_handler_stdout: ""
-default_handler_stderr: "rusty_alloc: error: double free of block 0xADDR (size 40, align 8)\n"
+default_handler_stderr: "rusty_alloc: error: double free of block 0xADDR (size 40, align 8)\nrusty_alloc:   found by thread T1 here:\nrusty_alloc:     debug_demo::site_free_again\nrusty_alloc:   freed by thread T1 here:\nrusty_alloc:     debug_demo::site_free\nrusty_alloc:   previously allocated by thread T1 here:\nrusty_alloc:     debug_demo::site_alloc\n"
 default_handler_signal: Some(6)

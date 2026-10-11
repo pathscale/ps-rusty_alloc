@@ -1,6 +1,6 @@
 Analysis of sampling ps-rusty_alloc-bench (pid 89759) every 1 millisecond
 Process:         ps-rusty_alloc-bench [89759]
-Path:            /Users/USER/*/ps-rusty_alloc-bench
+Path:            bench/bin/rusty_alloc
 Load Address:    0x102754000
 Identifier:      ps-rusty_alloc-bench
 Version:         0
@@ -62,7 +62,7 @@ Sort by top of stack, same collapsed (when >= 5):
         _RINvNtNtCs82bWklYMk3w_3std3sys9backtrace28___rust_begin_short_backtraceNCNvCs8Z4xgMRdJEb_20ps_rusty_alloc_bench7xthread0yEB1b_  (in ps-rusty_alloc-bench)        16
 
 Binary Images:
-       0x102754000 -        0x1027b6e47 +ps-rusty_alloc-bench (0) <B1FC1BE8-1385-35CF-AA2C-C1A2E208CFCA> /Users/*/ps-rusty_alloc-bench
+       0x102754000 -        0x1027b6e47 +ps-rusty_alloc-bench (0) <B1FC1BE8-1385-35CF-AA2C-C1A2E208CFCA> bench/bin/rusty_alloc
        0x187520000 -        0x187572b4b  libobjc.A.dylib (951.7) <FF1D8AE4-ABEF-35F1-A30A-1183B9CB414F> /usr/lib/libobjc.A.dylib
        0x187573000 -        0x1875a7d07  libdyld.dylib (1378) <B147D877-D0C2-388F-B38D-D3132E39905F> /usr/lib/system/libdyld.dylib
        0x1875a8000 -        0x18764e217  dyld (1.0.0 - 1378) <A237EF81-B68B-37BA-A165-92C965529534> /usr/lib/dyld

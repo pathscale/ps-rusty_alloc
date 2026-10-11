@@ -405,6 +405,7 @@ unsafe fn first_not(p: *const u8, b: u8, n: usize) -> Option<usize> {
 /// # Safety
 /// `GlobalAlloc::alloc` contract.
 pub(crate) unsafe fn alloc(layout: core::alloc::Layout, zero: bool) -> *mut u8 {
+    at_exit_register();
     let size = layout.size();
     let align = layout.align();
     let Some(total) = size.checked_add(HDR + TRAILER + 15) else {
@@ -700,4 +701,146 @@ pub(crate) unsafe fn realloc(p: *mut u8, layout: core::alloc::Layout, new_size: 
         release(p, h);
         np
     }
+}
+
+// ---------------------------------------------------------------------------
+// Leaks
+// ---------------------------------------------------------------------------
+
+/// A live block found by [`leak_report`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Leak {
+    /// The pointer `alloc` returned.
+    pub ptr: usize,
+    /// Requested size.
+    pub size: usize,
+    /// Requested alignment.
+    pub align: usize,
+    /// Allocation number on the allocating thread, counted from 1: blocks
+    /// with a number at or past a mark taken with [`alloc_seq`] were
+    /// allocated after it.
+    pub seq: u64,
+}
+
+/// Totals of a [`leak_report`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LeakSummary {
+    /// Live blocks.
+    pub blocks: usize,
+    /// Their requested bytes.
+    pub bytes: usize,
+}
+
+/// The calling thread's allocation number so far: a mark for
+/// [`leak_report`] (blocks with `seq > mark` came later).
+pub fn alloc_seq() -> u64 {
+    thread_debug().map_or(0, |d| d.seq.get())
+}
+
+/// Every live `RustyAlloc` block of the calling thread's heap and of the
+/// segments abandoned by exited threads, each handed to `f`. Blocks in the
+/// quarantine are freed and not listed. Built on `Heap::visit_blocks`, like
+/// `mi_heap_visit_blocks`; `f` must not allocate.
+///
+/// Not listed: blocks owned by other live threads (call it on each thread),
+/// and over-aligned blocks (align > 16) that the core placed at an offset
+/// inside its block.
+pub fn leak_report(f: &mut dyn FnMut(&Leak)) -> LeakSummary {
+    let mut sum = LeakSummary::default();
+    let mut visit = |_: &crate::heap::AreaInfo, block: *mut u8, bsize: usize| -> bool {
+        if block.is_null() || bsize < HDR + TRAILER {
+            return true;
+        }
+        // SAFETY: `block` is an allocated core block of `bsize` bytes, so its
+        // first HDR bytes are readable.
+        let (st, h) = unsafe { read_header(block.add(HDR)) };
+        if st == State::Live && HDR + h.size + TRAILER <= bsize {
+            sum.blocks += 1;
+            sum.bytes += h.size;
+            f(&Leak {
+                ptr: block.addr() + HDR,
+                size: h.size,
+                align: h.align as usize,
+                seq: h.seq,
+            });
+        }
+        true
+    };
+    let hb = crate::init::heap_box();
+    if !hb.is_null() && hb != crate::init::empty_heap_box_ptr() {
+        // SAFETY: the calling thread's own live heap; the visitor neither
+        // allocates nor frees.
+        unsafe {
+            (*(*hb).heap.get()).visit_blocks(true, &mut visit);
+        }
+    }
+    let sp = if hb.is_null() {
+        0
+    } else {
+        // SAFETY: a heap box (or the sentinel) is always readable.
+        unsafe { (*hb).subproc.load(Ordering::Relaxed) }
+    };
+    crate::init::abandoned_visit_blocks(sp, -1, true, &mut visit);
+    sum
+}
+
+/// Print a leak summary and the first `max` leaks to the output hook.
+pub fn print_leaks(max: usize) -> LeakSummary {
+    let mut n = 0;
+    let sum = leak_report(&mut |l| {
+        if n < max {
+            let mut b = Line::new();
+            let _ = fmt::write(
+                &mut b,
+                format_args!(
+                    "rusty_alloc: leak: {:#x} size {} align {} seq {}\n",
+                    l.ptr, l.size, l.align, l.seq
+                ),
+            );
+            crate::options::out_fmt(b.as_str());
+        }
+        n += 1;
+    });
+    let mut b = Line::new();
+    let _ = fmt::write(
+        &mut b,
+        format_args!(
+            "rusty_alloc: leaks: {} blocks, {} bytes still allocated\n",
+            sum.blocks, sum.bytes
+        ),
+    );
+    crate::options::out_fmt(b.as_str());
+    sum
+}
+
+// ---------------------------------------------------------------------------
+// At exit
+// ---------------------------------------------------------------------------
+
+#[cfg(all(unix, feature = "std", not(miri)))]
+static AT_EXIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// With `show_stats` on (`RUSTY_ALLOC_SHOW_STATS=1` or
+/// `MIMALLOC_SHOW_STATS=1`), print the report at process exit, as
+/// mimalloc does. Registered on the first debug allocation.
+#[inline]
+fn at_exit_register() {
+    #[cfg(all(unix, feature = "std", not(miri)))]
+    if !AT_EXIT.load(Ordering::Relaxed) && !AT_EXIT.swap(true, Ordering::Relaxed) {
+        extern "C" fn at_exit() {
+            if crate::options::is_enabled(1) {
+                print_report();
+            }
+        }
+        // SAFETY: registers a plain `extern "C"` function.
+        unsafe {
+            libc::atexit(at_exit);
+        }
+    }
+}
+
+/// Everything debug mode knows, to the output hook: the leak summary with
+/// the first 16 leaks.
+pub fn print_report() {
+    print_leaks(16);
 }

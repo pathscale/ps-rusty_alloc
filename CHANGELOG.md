@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `RustyAlloc`: a `GlobalAlloc` front end in the crate (`src/global.rs`), the
+  same routing as `rusty_alloc-api` 2.2.6. Its machine code in the benchmark
+  binary is byte-identical to the bench shim it replaces.
+
 ## [2.2.6](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.2.5...rusty_alloc-v2.2.6) - 2026-10-09
 
 ### Fixed

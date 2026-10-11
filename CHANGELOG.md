@@ -20,6 +20,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `stats`, `fragmentation_report` and the report at exit with `show_stats`.
   Off, the performance build is byte-identical.
 
+## 2.3.0 - 2026-10-11
+
+First ps-rusty_alloc release, from rusty_alloc 2.2.6.
+
+### Changed
+
+- Bounded freed-but-resident arena chunks (`RESIDENT_FREE_BUDGET = 8`), the
+  budget state kept in the arena bitmaps so every chunk claim settles it. Peak
+  RSS under waves of short-lived threads drops from 1.21-1.24x mimalloc to 1.01x.
+- Best fit instead of first fit over a segment's free spans. A Vec, String and
+  HashMap workload drops from 1.42x to 1.07x mimalloc peak memory.
+- Package renamed to `ps-rusty_alloc`; the library stays `rusty_alloc`.
+
 ## [2.2.6](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.2.5...rusty_alloc-v2.2.6) - 2026-10-09
 
 ### Fixed

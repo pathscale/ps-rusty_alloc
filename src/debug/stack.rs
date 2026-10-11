@@ -372,6 +372,25 @@ pub fn capture_in(lo: usize, hi: usize, skip: usize) -> StackId {
     intern(&f[..n])
 }
 
+/// The stack from the frame `fp` outwards: its first entry is the return
+/// address into the caller of the function that owns `fp`. Without
+/// allocating; honors [`stack_depth`].
+///
+/// # Safety
+/// `fp` is the frame pointer of a frame still live on the calling thread
+/// (or any value outside `lo..hi`, which records nothing), and `lo..hi` are
+/// this thread's stack bounds.
+pub(crate) unsafe fn capture_from(fp: usize, lo: usize, hi: usize) -> StackId {
+    let depth = stack_depth();
+    if !SUPPORTED || depth == 0 || lo >= hi {
+        return StackId::NONE;
+    }
+    let mut f = [0usize; MAX_FRAMES];
+    // SAFETY: per contract.
+    let n = unsafe { walk(fp, lo, hi, 0, &mut f[..depth]) };
+    intern(&f[..n])
+}
+
 // ---------------------------------------------------------------------------
 // Printing
 // ---------------------------------------------------------------------------

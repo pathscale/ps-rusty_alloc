@@ -421,16 +421,23 @@ fn stack_bounds() -> (usize, usize) {
     (d.stack_lo.get(), d.stack_hi.get())
 }
 
-/// Stack of the caller's caller: called at the top of a debug entry point,
-/// it records where the program called into the allocator.
-#[inline(never)]
+/// Where the program called into the allocator. Inlined into a debug entry
+/// point, it walks from that function's own frame, so the first entry is the
+/// return address into whoever called the entry. Starting from a frame
+/// rather than skipping a fixed count cannot drop a program frame, however
+/// the entry was reached (`__rust_alloc`, a direct `GlobalAlloc` call or
+/// the raw API); at worst a report starts with an allocator frame, as an
+/// ASan report starts with `free`.
+#[inline(always)]
 fn here() -> StackId {
     if !stack::SUPPORTED || stack::stack_depth() == 0 {
         return StackId::NONE;
     }
+    let fp = stack::frame_pointer();
     let (lo, hi) = stack_bounds();
-    // Records: into `here`, into the entry point, then the program.
-    stack::capture_in(lo, hi, 2)
+    // SAFETY: `fp` is the frame of the running function, live on this
+    // thread's stack; `lo..hi` are its bounds.
+    unsafe { stack::capture_from(fp, lo, hi) }
 }
 
 /// Capture the calling function's stack into the depot (debug mode keeps

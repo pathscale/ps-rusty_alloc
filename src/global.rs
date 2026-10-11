@@ -11,11 +11,14 @@ use core::alloc::{GlobalAlloc, Layout};
 /// The global allocator. `#[global_allocator] static A: RustyAlloc = RustyAlloc;`
 pub struct RustyAlloc;
 
+#[cfg(not(feature = "debug_checks"))]
 const WORD: usize = core::mem::size_of::<usize>();
+#[cfg(not(feature = "debug_checks"))]
 const NATURAL_ALIGN: usize = 2 * WORD;
 
 // SAFETY: every method forwards to the core allocator, which returns blocks of
 // at least the requested size and alignment, or null.
+#[cfg(not(feature = "debug_checks"))]
 unsafe impl GlobalAlloc for RustyAlloc {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -81,5 +84,31 @@ unsafe impl GlobalAlloc for RustyAlloc {
                 np
             }
         }
+    }
+}
+
+// SAFETY: the debug layer allocates through the same core allocator, with a
+// header in front and a canary behind the block it returns, and checks every
+// pointer before it frees it.
+#[cfg(feature = "debug_checks")]
+unsafe impl GlobalAlloc for RustyAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: forwarded contract.
+        unsafe { crate::debug::alloc(layout, false) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: forwarded contract.
+        unsafe { crate::debug::dealloc(ptr, layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: forwarded contract.
+        unsafe { crate::debug::alloc(layout, true) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: forwarded contract.
+        unsafe { crate::debug::realloc(ptr, layout, new_size) }
     }
 }

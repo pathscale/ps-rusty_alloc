@@ -63,6 +63,12 @@ pub struct HeapBox {
     pub allow_destroy: bool,
     /// The owner-only heap state.
     pub heap: UnsafeCell<Heap>,
+    /// Debug-mode state of the owning thread (`debug_checks` only):
+    /// allocation numbers, quarantine, counters. All `Cell`s, so the debug
+    /// layer and the chunk paths may touch it while a `&mut Heap` is live.
+    /// Last, so no field the platform TLS code addresses moves.
+    #[cfg(feature = "debug_checks")]
+    pub(crate) dbg: crate::debug::ThreadDebug,
 }
 
 const _: () = assert!(core::mem::offset_of!(HeapBox, delayed) == 0);
@@ -123,6 +129,8 @@ pub static EMPTY_HEAP_BOX: EmptyHeapBox = EmptyHeapBox(HeapBox {
     tag: 0,
     allow_destroy: false,
     heap: UnsafeCell::new(Heap::new()),
+    #[cfg(feature = "debug_checks")]
+    dbg: crate::debug::ThreadDebug::new(),
 });
 
 /// Pointer to the shared empty heap box.
@@ -638,6 +646,8 @@ fn create_heap_uninstalled(tag: i32, allow_destroy: bool, arena_id: i32) -> *mut
                 } else {
                     Heap::new()
                 }),
+                #[cfg(feature = "debug_checks")]
+                dbg: crate::debug::ThreadDebug::new(),
             },
         );
         (*(*hb).heap.get()).delayed = &raw const (*hb).delayed;

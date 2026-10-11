@@ -128,7 +128,7 @@ pub fn is_aligned_at(addr: usize, offset: usize, align: usize) -> bool {
 /// interior pointer; the callers refuse with null instead (OH-rusty_alloc-6).
 #[inline]
 pub(crate) fn aligned_at_from(base: usize, offset: usize, align: usize) -> Option<usize> {
-    debug_assert!(align.is_power_of_two() && align > 0);
+    ra_debug_assert!(align.is_power_of_two() && align > 0);
     let sum = base.checked_add(offset)?.checked_add(align - 1)?;
     let rounded = sum & !(align - 1);
     rounded.checked_sub(offset)
@@ -178,11 +178,11 @@ pub(crate) fn div_by_block_size(n: usize, bsize: usize) -> usize {
     let k = bsize.trailing_zeros();
     let odd = bsize >> k;
     let m = (n >> k) as u64;
-    debug_assert!(
+    ra_debug_assert!(
         matches!(odd, 1 | 3 | 5 | 7),
         "bin_size {bsize} has odd part {odd}, outside the {{1,3,5,7}} this relies on"
     );
-    debug_assert!(
+    ra_debug_assert!(
         m < (1 << 30),
         "div_by_block_size: {n} >> {k} exceeds the bound the 32-bit reciprocals are exact over"
     );
@@ -213,7 +213,7 @@ pub(crate) fn exact_div_by_block_size(n: usize, bsize: usize) -> usize {
 
     let k = bsize.trailing_zeros();
     let odd = bsize >> k;
-    debug_assert!(
+    ra_debug_assert!(
         bsize != 0 && n.is_multiple_of(bsize),
         "exact_div_by_block_size: {n} is not a multiple of {bsize}"
     );

@@ -365,7 +365,7 @@ impl Heap {
     /// on any miss, so a wrong bin would mis-size a block rather than fault —
     /// hence the debug assertion.
     fn malloc_in_bin(&mut self, size: usize, bin: usize) -> (*mut u8, bool) {
-        debug_assert_eq!(bin, bins::bin(size), "malloc_in_bin: bin/size disagree");
+        ra_debug_assert_eq!(bin, bins::bin(size), "malloc_in_bin: bin/size disagree");
         // MEDIUM sizes get a fast path too.
         //
         // `direct[]` is indexed by word size and stops at SMALL_WSIZE_MAX, so
@@ -1076,7 +1076,7 @@ impl Heap {
             (*seg).next = self.segments;
             self.segments = seg;
             let (p, fresh) = span_alloc(seg, slices);
-            debug_assert!(!p.is_null());
+            ra_debug_assert!(!p.is_null());
             Some((p, fresh))
         }
     }
@@ -1244,7 +1244,7 @@ impl Heap {
         let unlinked = unsafe { self.try_unlink_huge_segment(seg) };
         // Diagnostic only — the RETURN above is what the caller acts on, and
         // it is correct in release where this assertion does not exist.
-        debug_assert!(unlinked, "huge segment not in heap list");
+        ra_debug_assert!(unlinked, "huge segment not in heap list");
         unlinked
     }
 
@@ -1335,7 +1335,7 @@ impl Heap {
             if !b.is_null() && b.addr() & align.wrapping_sub(1) == 0 {
                 // SAFETY: as `Heap::malloc` — pop from this thread's own page.
                 let b = unsafe { crate::page::page_pop(p) };
-                debug_assert!(!b.is_null());
+                ra_debug_assert!(!b.is_null());
                 self.stat_alloc();
                 // SAFETY: p live per above.
                 return (b, unsafe { (*p).free_is_zero });
@@ -1423,7 +1423,7 @@ impl Heap {
             return (ptr::null_mut(), false);
         }
         let p = block.with_addr(addr);
-        debug_assert!((p.addr() + offset).is_multiple_of(align));
+        ra_debug_assert!((p.addr() + offset).is_multiple_of(align));
         if p != block {
             // SAFETY: block is ours, just allocated on this thread; marking
             // the page before the pointer escapes (see Page::has_aligned).
@@ -1442,7 +1442,7 @@ impl Heap {
     /// # Safety
     /// Caller must be this heap's owning thread.
     pub unsafe fn process_delayed(&mut self) {
-        debug_assert!(!self.delayed.is_null(), "every heap has a delayed list");
+        ra_debug_assert!(!self.delayed.is_null(), "every heap has a delayed list");
         // SAFETY: delayed points into our own live HeapBox; blocks on it are
         // dead blocks of pages we own.
         unsafe {
@@ -1452,7 +1452,7 @@ impl Heap {
             // zero and `drain_delayed` is 995 bytes the linker kept for it
             // (`docs/plans/finished/firmware-code-size.md`, lever 1).
             if crate::ONE_THREAD {
-                debug_assert_eq!(
+                ra_debug_assert_eq!(
                     (*self.delayed).head.load(Ordering::Acquire),
                     0,
                     "a cross-thread free landed on a build that asserted a single thread"
@@ -1927,7 +1927,7 @@ impl Heap {
             // established that this page is not its queue's sole member,
             // answering it from the page's own links without touching the
             // heap, so re-deriving `q` to ask again is provably dead.
-            debug_assert!(
+            ra_debug_assert!(
                 !((*q).first == pg && (*q).last == pg),
                 "retire_emptied: sole-member page should have been kept warm by the caller"
             );
@@ -1945,9 +1945,9 @@ impl Heap {
     /// # Safety
     /// As [`free_local`], with `seg == segment_of(p)`.
     pub unsafe fn free_local_at(&mut self, seg: *mut Segment, pg: *mut Page, p: *mut u8) {
-        debug_assert_eq!(seg, segment_of(p));
+        ra_debug_assert_eq!(seg, segment_of(p));
         // SAFETY: caller resolved this page already.
-        debug_assert!(pg.is_null() || unsafe { pg == segment::page_of(seg, p) });
+        ra_debug_assert!(pg.is_null() || unsafe { pg == segment::page_of(seg, p) });
         // SAFETY: p is ours per the contract, so seg is a live segment header.
         unsafe {
             // NOTE (2026-08-21): passing the caller's already-read `flags`
@@ -2148,7 +2148,7 @@ impl Heap {
                 }
                 cur = &raw mut (**cur).next;
             }
-            debug_assert!(false, "segment not in heap list"); // nosemgrep: debug-assert-false-as-error-path -- diagnostic; the `false` return below is what callers act on
+            ra_debug_assert!(false, "segment not in heap list"); // nosemgrep: debug-assert-false-as-error-path -- diagnostic; the `false` return below is what callers act on
             false
         }
     }

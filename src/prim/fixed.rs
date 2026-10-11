@@ -1062,7 +1062,7 @@ fn place(
     if size > len {
         return None;
     }
-    debug_assert!(base >= origin, "an extent lies inside the region");
+    ra_debug_assert!(base >= origin, "an extent lies inside the region");
     // Alignment is measured from `origin` — the region's base — not from
     // address zero: segments stride from it and `segment_of` resolves against
     // it (`crate::REGION_STRIDES`). `origin` is REGION_ALIGN-aligned, so a

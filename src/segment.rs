@@ -176,7 +176,7 @@ pub fn segment_of(p: *mut u8) -> *mut Segment {
 #[inline]
 pub fn segment_of(p: *mut u8) -> *mut Segment {
     let base = crate::segment_map::base_of(p.addr());
-    debug_assert!(
+    ra_debug_assert!(
         base != 0,
         "segment_of: unmapped wasm address {:#x}",
         p.addr()
@@ -197,7 +197,7 @@ fn reserve_backing(want: usize) -> Result<(*mut u8, usize, bool), PrimError> {
     #[cfg(all(target_arch = "wasm32", not(miri)))]
     {
         let size = os::page_align_up(want); // wasm page == slice == 64 KiB
-        debug_assert!(size.is_multiple_of(SEGMENT_SLICE_SIZE));
+        ra_debug_assert!(size.is_multiple_of(SEGMENT_SLICE_SIZE));
         if let Some(addr) = crate::slice_pool::alloc_run(size / SEGMENT_SLICE_SIZE) {
             // Provenance: pool addresses were exposed when their blocks were
             // freed (`expose_provenance` at the free sites).
@@ -224,7 +224,7 @@ pub unsafe fn page_of(seg: *mut Segment, p: *mut u8) -> *mut Page {
     // the same value without the subtraction, since `seg` is `p` masked —
     // measured FLAT. LLVM already sees through the mask here.
     let idx = (p.addr() - seg.addr()) / SEGMENT_SLICE_SIZE;
-    debug_assert!(
+    ra_debug_assert!(
         idx < SLICES_PER_SEGMENT,
         "page_of: slice index out of range"
     );
@@ -248,7 +248,7 @@ pub unsafe fn page_of(seg: *mut Segment, p: *mut u8) -> *mut Page {
         // duplicated state safe to keep, and it is free in release.
         // (A Huge segment keeps `page_off` alone: its interior slots' offsets
         // are not written, see `huge_alloc`.)
-        debug_assert!(
+        ra_debug_assert!(
             (*seg).kind == SegmentKind::Huge || {
                 let base: *mut Page = (&raw mut (*seg).pages).cast();
                 let slot = base.add(idx);
@@ -312,7 +312,7 @@ pub unsafe fn page_index(seg: *mut Segment, page: *mut Page) -> usize {
         let idx = ((*page).area.addr() - seg.addr()) / SEGMENT_SLICE_SIZE;
         // (A Huge segment keeps `page_off` alone: its interior slots' offsets
         // are not written, see `huge_alloc`.)
-        debug_assert!(
+        ra_debug_assert!(
             (*seg).kind == SegmentKind::Huge || {
                 let base: *mut Page = (&raw mut (*seg).pages).cast();
                 idx == (page.addr() - base.addr()) / core::mem::size_of::<Page>()
@@ -613,7 +613,7 @@ pub unsafe fn segment_free(seg: *mut Segment) -> Result<(), PrimError> {
 /// `from >= 1`, and slices `idx+1 .. idx+min(from, len)` must already point
 /// back to `idx`.
 unsafe fn span_mark(seg: *mut Segment, idx: usize, len: usize, from: usize) {
-    debug_assert!(from >= 1, "span_mark: slot 0 is the head, not an interior");
+    ra_debug_assert!(from >= 1, "span_mark: slot 0 is the head, not an interior");
     // SAFETY: caller contract keeps every index in bounds.
     unsafe {
         (*seg).pages[idx].slice_offset = 0;
@@ -730,19 +730,19 @@ pub unsafe fn debug_validate_segment(seg: *mut Segment, where_: &str) {
             let mut spans = 0usize;
             while idx < end {
                 let slot: *mut Page = &raw mut (*seg).pages[idx];
-                assert_eq!(
+                ra_assert_eq!(
                     (*slot).slice_offset,
                     0,
                     "{where_}: slice {idx} is not a span start (layout not tiled)"
                 );
                 let len = (*slot).slice_count as usize;
-                assert!(
+                ra_assert!(
                     len > 0 && idx + len <= end,
                     "{where_}: slice {idx} has bad slice_count {len} (end {end})"
                 );
                 // Interior slices must point back to this start.
                 for j in 1..len {
-                    assert_eq!(
+                    ra_assert_eq!(
                         (*seg).pages[idx + j].slice_offset as usize,
                         j,
                         "{where_}: slice {} lost its back-pointer",
@@ -750,26 +750,26 @@ pub unsafe fn debug_validate_segment(seg: *mut Segment, where_: &str) {
                     );
                 }
                 spans += 1;
-                assert!(
+                ra_assert!(
                     spans <= SLICES_PER_SEGMENT,
                     "{where_}: span walk did not terminate"
                 );
                 idx += len;
             }
-            assert_eq!(idx, end, "{where_}: spans do not tile the carved region");
+            ra_assert_eq!(idx, end, "{where_}: spans do not tile the carved region");
             // Free-span list: every node is a free span start inside the region.
             let mut s = (*seg).free_spans;
             let mut n = 0usize;
             while !s.is_null() {
                 let i = page_index(seg, s);
-                assert!(
+                ra_assert!(
                     i >= HEADER_SLICES && i < end,
                     "{where_}: free span {i} out of region"
                 );
-                assert_eq!((*s).slice_offset, 0, "{where_}: free span {i} not a start");
-                assert_eq!((*s).block_size, 0, "{where_}: free span {i} marked live");
+                ra_assert_eq!((*s).slice_offset, 0, "{where_}: free span {i} not a start");
+                ra_assert_eq!((*s).block_size, 0, "{where_}: free span {i} marked live");
                 n += 1;
-                assert!(
+                ra_assert!(
                     n <= SLICES_PER_SEGMENT,
                     "{where_}: free-span list is cyclic"
                 );
@@ -917,7 +917,7 @@ pub unsafe fn span_free(seg: *mut Segment, page: *mut Page) -> bool {
         let right = idx + len;
         if right < (*seg).next_free_slice as usize {
             let rslot: *mut Page = &raw mut (*seg).pages[right];
-            debug_assert_eq!((*rslot).slice_offset, 0, "right neighbor not a span start");
+            ra_debug_assert_eq!((*rslot).slice_offset, 0, "right neighbor not a span start");
             if (*rslot).block_size == 0 {
                 span_list_remove(seg, rslot);
                 len += (*rslot).slice_count as usize;
@@ -1166,7 +1166,9 @@ pub fn huge_alloc(
             return Err(0);
         }
         let block = area.with_addr(addr);
-        debug_assert!(block.addr() >= area.addr() && (block.addr() + offset).is_multiple_of(align));
+        ra_debug_assert!(
+            block.addr() >= area.addr() && (block.addr() + offset).is_multiple_of(align)
+        );
         // The single page lives in slot 1; every reachable interior slice
         // offsets back to it (only slices 1..512 are addressable via the mask
         // trick, and aligned offsets stay < SEGMENT_SIZE/2 by the contract).
@@ -1200,7 +1202,7 @@ pub fn huge_alloc(
         // for a huge block (`SINGLE_BLOCK` is set, so `unalign` does not take
         // its early return).
         (*page).area = area;
-        debug_assert_eq!(
+        ra_debug_assert_eq!(
             (*page).area,
             page_area(seg, 1),
             "huge: area != page_area(1)"

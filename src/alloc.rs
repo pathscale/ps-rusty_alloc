@@ -33,7 +33,7 @@ unsafe fn unalign(pg: *mut Page, p: *mut u8) -> *mut u8 {
         // divide by `size_of::<Page>()` (88 = 8 * 11 — `docs/opps.md` #1) and
         // the scale back up. One load replaces all of it.
         let area = (*pg).area;
-        debug_assert!(
+        ra_debug_assert!(
             {
                 let seg = segment_of(p);
                 area == segment::page_area(seg, segment::page_index(seg, pg))
@@ -122,7 +122,7 @@ unsafe fn owner_heap(pg: *mut Page) -> *mut Heap {
             // path requires this thread to own the segment, which requires it
             // to have allocated, which requires a created heap.
             let h = my_heap();
-            debug_assert!(!h.is_null(), "owner_heap fallback on a heapless thread");
+            ra_debug_assert!(!h.is_null(), "owner_heap fallback on a heapless thread");
             h
         }
     }
@@ -179,7 +179,7 @@ fn my_heap() -> *mut Heap {
 fn debug_foreign_pointer_guard(p: *mut u8) {
     #[cfg(any(debug_assertions, feature = "debug_checks"))]
     {
-        assert!(
+        ra_assert!(
             crate::segment_map::contains(p),
             "rusty_alloc: free() called on a pointer this allocator never returned \
              ({p:p} is not in any registered segment window). A foreign pointer here \
@@ -592,7 +592,7 @@ pub fn malloc_aligned_at(size: usize, align: usize, offset: usize) -> *mut u8 {
 /// block would not be aligned as asked.)
 #[inline]
 pub unsafe fn malloc_aligned_pow2(size: usize, align: usize) -> *mut u8 {
-    debug_assert!(align.is_power_of_two(), "malloc_aligned_pow2: {align}");
+    ra_debug_assert!(align.is_power_of_two(), "malloc_aligned_pow2: {align}");
     aligned_at_impl::<true>(size, align, 0)
 }
 
@@ -1085,12 +1085,12 @@ pub unsafe fn free_inline(p: *mut u8) {
                 // would otherwise send a huge or unqueued span down the binned
                 // path and corrupt silently — so assert it where the decision
                 // is actually made, not in a helper that may go uncalled.
-                debug_assert_eq!(
+                ra_debug_assert_eq!(
                     (*seg).kind,
                     SegmentKind::Normal,
                     "free fast path: HUGE_SEGMENT clear but segment is Huge"
                 );
-                debug_assert_ne!(
+                ra_debug_assert_ne!(
                     (*pg).bin as usize,
                     BIN_HUGE,
                     "free fast path: SINGLE_BLOCK clear but bin is BIN_HUGE"
@@ -1320,8 +1320,8 @@ unsafe fn free_general(p: *mut u8, seg: *mut Segment, pg: *mut Page, owner_tid: 
         // Acquire BEFORE reading page metadata, for the same reason `free`
         // does: it synchronizes with an abandoning thread's release, so the
         // flags we read cannot predate an adoption.
-        debug_assert_eq!(seg, segment_of(p));
-        debug_assert_eq!(pg, page_of(seg, p));
+        ra_debug_assert_eq!(seg, segment_of(p));
+        ra_debug_assert_eq!(pg, page_of(seg, p));
         // NOTE: passing the caller's `flags` byte in as a fourth argument
         // too, sparing the load below, measured FLAT — the argument costs what
         // the load saves. `seg` and `pg` are worth passing because they are
@@ -1411,7 +1411,7 @@ pub unsafe fn usable_size(p: *const u8) -> usize {
         if flags & (pflags::HAS_ALIGNED | pflags::SINGLE_BLOCK | pflags::HUGE_SEGMENT) == 0 {
             return (*pg).block_size;
         }
-        debug_assert_eq!(
+        ra_debug_assert_eq!(
             flags & pflags::HUGE_SEGMENT != 0,
             (*seg).kind == SegmentKind::Huge,
             "usable_size: HUGE_SEGMENT flag disagrees with the segment kind"
@@ -1650,7 +1650,7 @@ pub fn stats() -> crate::heap::Stats {
 unsafe fn heap_of(hb: *mut init::HeapBox) -> *mut Heap {
     // SAFETY: hb live per contract.
     unsafe {
-        debug_assert_eq!(
+        ra_debug_assert_eq!(
             (*hb).owner_tid,
             init::thread_id(),
             "heap used off its owning thread"

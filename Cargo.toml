@@ -11,7 +11,7 @@
 
 [package]
 edition = "2024"
-name = "rusty_alloc"
+name = "ps-rusty_alloc"
 version = "2.2.6"
 authors = ["remade-with-rust"]
 build = false
@@ -38,6 +38,8 @@ categories = [
 license = "MIT"
 repository = "https://github.com/remade-with-rust/rusty_alloc"
 resolver = "2"
+publish = false
+exclude = ["bench"]
 
 [features]
 blockmap = []

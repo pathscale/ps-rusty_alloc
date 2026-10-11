@@ -1,0 +1,19 @@
+name: CI
+
+# Manual only: the gate is the local run before a PR merges.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build, clippy, fmt, tests
+    runs-on: ubicloud-standard-2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo build --release
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo fmt --check
+      - run: cargo test --release

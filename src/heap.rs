@@ -553,7 +553,7 @@ impl Heap {
     #[cold]
     #[inline(never)]
     fn malloc_generic_retry(&mut self, size: usize) -> (*mut u8, u8) {
-        if IN_OOM_RETRY.with(Cell::get) {
+        if IN_OOM_RETRY.with(|c| c.get()) {
             return (ptr::null_mut(), 0);
         }
         IN_OOM_RETRY.with(|c| c.set(true));

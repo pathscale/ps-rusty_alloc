@@ -1,18 +1,31 @@
 # ps-rusty_alloc
 
+[![Crates.io](https://img.shields.io/crates/v/ps-rusty_alloc.svg)](https://crates.io/crates/ps-rusty_alloc)
+[![Documentation](https://docs.rs/ps-rusty_alloc/badge.svg)](https://docs.rs/ps-rusty_alloc)
+
 Pathscale fork of [rusty_alloc](https://github.com/remade-with-rust/rusty_alloc) 2.2.6,
 a pure-Rust remake of mimalloc. Imported from the crates.io 2.2.6 tarball, which
 matches upstream commit `61ae839`. No upstream git history is carried; the first
 commit here is the pristine import.
 
-The package is `ps-rusty_alloc`; its library remains `rusty_alloc`. It is not
-published (`publish = false`).
+The package is `ps-rusty_alloc`; its library remains `rusty_alloc`, so
+`use rusty_alloc::...` is unchanged:
+
+```toml
+[dependencies]
+rusty_alloc = { package = "ps-rusty_alloc", version = "2.3" }
+```
 
 Changes in this fork:
 
 - Bounded freed-but-resident arena chunks (`RESIDENT_FREE_BUDGET = 8` in
   `src/segment.rs`). Peak RSS under waves of short-lived threads drops from
   1.21-1.24x mimalloc to 1.01x. See [docs/resident-budget.md](docs/resident-budget.md).
+  The budget state lives in the arena bitmaps, so every chunk claim, huge
+  allocations included, settles it.
+- Best fit instead of first fit over a segment's free spans. A Vec, String and
+  HashMap workload drops from 1.42x to 1.07x mimalloc peak memory, and 0.56x at
+  8 threads.
 - A standalone benchmark crate in [bench/](bench/README.md), the only place
   the C mimalloc appears. Results and methodology: [docs/benchmarks.md](docs/benchmarks.md).
 - `LICENSE` keeps the upstream MIT text and copyright; the upstream note about
@@ -21,7 +34,9 @@ Changes in this fork:
 Debugging and visibility, what exists upstream, what was added and what is
 planned: [docs/debugging.md](docs/debugging.md).
 
-CI is manual (`workflow_dispatch`). The gate is the local run:
+CI and publishing are manual (`workflow_dispatch`). The version in `Cargo.toml`
+is the release: a version bump merged to `master` is published from that commit.
+The gate is the local run:
 
 ```sh
 cargo build

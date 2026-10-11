@@ -281,6 +281,7 @@ pub(crate) const ONE_REGION: bool = FIXED_REGION && cfg!(ra_single_threaded);
 pub mod alloc;
 pub mod arena;
 pub mod bins;
+pub mod global;
 pub mod heap;
 pub mod init;
 pub mod options;
@@ -303,6 +304,7 @@ pub mod stats;
 pub mod types;
 
 pub use bins::good_size;
+pub use global::RustyAlloc;
 
 /// Rebuild a pointer at `addr` keeping `p`'s provenance. Used wherever an
 /// address round-trips through an integer (atomic words, encoded links) — the

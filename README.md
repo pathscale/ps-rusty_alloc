@@ -26,6 +26,14 @@ Changes in this fork:
 - Best fit instead of first fit over a segment's free spans. A Vec, String and
   HashMap workload drops from 1.42x to 1.07x mimalloc peak memory, and 0.56x at
   8 threads.
+- `rusty_alloc::RustyAlloc`, a `GlobalAlloc` in the crate itself (`src/global.rs`),
+  with the same routing as upstream's separate `rusty_alloc-api` crate, so no
+  second crate is needed and the benchmarks measure exactly this type:
+
+  ```rust
+  #[global_allocator]
+  static GLOBAL: rusty_alloc::RustyAlloc = rusty_alloc::RustyAlloc;
+  ```
 - A standalone benchmark crate in [bench/](bench/README.md), the only place
   the C mimalloc appears. Results and methodology: [docs/benchmarks.md](docs/benchmarks.md).
 - `LICENSE` keeps the upstream MIT text and copyright; the upstream note about

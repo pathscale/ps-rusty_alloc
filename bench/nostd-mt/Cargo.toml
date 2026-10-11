@@ -1,0 +1,41 @@
+[package]
+name = "nostd-mt"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Standalone: a #![no_std] #![no_main] binary with ps-rusty_alloc as its global
+# allocator and many pthreads. Run through ../nostd.ts; see ../README.md and
+# docs/no_std.md.
+[workspace]
+
+[dependencies]
+rusty_alloc = { package = "ps-rusty_alloc", path = "../..", default-features = false }
+libc = { version = "0.2", default-features = false }
+
+[features]
+# The debug layer (`debug_checks`), and the `doublefree` mode that triggers it.
+debug = ["rusty_alloc/debug_checks"]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = "fat"
+codegen-units = 1
+# Keep the symbol table whole: ../nostd-nm.ts reads it.
+strip = false
+
+# Release code with debug assertions and overflow checks on: every
+# ra_debug_assert! in the allocator, and the KeyLocal fast-path cross-check.
+[profile.checked]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true
+
+# The same binary with panic = "unwind" (needs a nightly toolchain for the
+# eh_personality lang item; see docs/no_std.md).
+[profile.unwind]
+inherits = "release"
+panic = "unwind"

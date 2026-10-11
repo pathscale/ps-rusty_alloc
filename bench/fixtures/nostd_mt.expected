@@ -1,0 +1,10 @@
+profile: no_std, multi-threaded
+threads: 16 per round, 8 rounds, 128 spawned
+blocks_allocated: 2560000
+blocks_validated: 2560000
+cross_thread_handoffs: 365919
+freed_after_owner_exit: 2048
+large_blocks: 2522
+words_checked: 906323981
+corrupt: 0
+result: ok

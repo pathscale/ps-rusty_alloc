@@ -1,7 +1,7 @@
 [package]
 edition = "2024"
 name = "ps-rusty_alloc"
-version = "2.3.1"
+version = "2.3.2"
 authors = ["remade-with-rust", "PathScale"]
 build = false
 autolib = false

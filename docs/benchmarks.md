@@ -318,6 +318,47 @@ Source: `bench/results/r1k-summary-2026-10-11T07-06-58-322Z.md`
 | workers:4 | ra_r1 | 120.3 (1.05) | 7.208 (1.00) | 1.782 (1.03) | 142.3 (0.76) | 142.0 (0.76) | 7 |
 | workers:4 | ra_r1k8 | 109.8 (0.96) | 6.847 (0.95) | 1.665 (0.96) | 145.3 (0.77) | 144.9 (0.77) | 7 |
 
+### Free-span best fit and arena chunk state (perf-coalescing)
+
+7 rounds. `base` is master before these commits (source identical to
+`143c0bb`), `final` is the head of `perf-coalescing` (best fit in
+`span_alloc` plus the arena-side resident budget state). Ratios against
+mimalloc.
+
+Source: `bench/results/final-summary-2026-10-11T07-36-14-602Z.md` (the
+best-fit commit alone: `bench/results/v1-summary-2026-10-11T07-29-24-856Z.md`).
+
+| workload | base wall / instr / RSS | final wall / instr / RSS | final vs base |
+|---|---|---|---|
+| tasks:1 | 0.91 / 0.91 / 0.93 | 0.91 / 0.91 / 0.95 | flat (4.666 vs 4.667 G instr) |
+| tasksbig:1 | 0.91 / 0.80 / 0.99 | 0.91 / 0.80 / 0.99 | flat |
+| small:1 | 0.87 / 0.64 / 0.87 | 0.87 / 0.64 / 0.89 | flat |
+| realistic:1 | 0.91 / 0.90 / 1.42 | 0.91 / 0.90 / 1.07 | RSS 5.9 -> 4.5 MB |
+| phases:1 | 0.88 / 0.76 / 1.01 | 0.88 / 0.76 / 1.01 | flat |
+| large:1 | 0.73 / 0.38 / 0.73 | 0.71 / 0.36 / 0.72 | instr -6% |
+| tasks:4 | 0.85 / 0.91 / 1.01 | 0.85 / 0.91 / 1.02 | flat |
+| small:16 | 0.73 / 0.64 / 1.07 | 0.75 / 0.64 / 1.07 | flat |
+| xthread:1 | 1.12 / 0.47 / 0.90 | 1.13 / 0.47 / 0.90 | flat |
+| xthread:4 | 0.94 / 0.55 / 0.93 | 0.94 / 0.55 / 0.94 | flat |
+| realistic:8 | 0.82 / 0.90 / 0.78 | 0.82 / 0.90 / 0.56 | RSS 51.7 -> 37.3 MB |
+| large:4 | 0.52 / 0.35 / 0.90 | 0.54 / 0.33 / 0.90 | instr -7% |
+| workers:16 | 1.09 / 0.99 / 1.06 | 1.14 / 1.00 / 1.07 | within noise (see below) |
+
+`workers:16` max RSS moves by tens of MB between runs for every allocator
+(mimalloc itself read 416.6 to 477.6 MB across today's runs); a 15-round
+A/B of the arena-state commit alone read 475.7 vs 466.1 MB and 209.2 vs
+209.1 ms.
+
+Why best fit: `BENCH_SEG_PROBE` on `realistic:1` showed the segment's
+high-water slice creeping 90 -> 97 -> 104 -> 111 over 150 iterations, with
+25 free slices (1.36 MiB resident, per `mincore`) stranded in holes. First
+fit on the LIFO free-span list split the hole a large free had just left
+(a HashMap table's old storage) for a one-slice page, so the next table of
+that size found no hole and carved fresh slices. With best fit and an
+exact-fit early exit the high-water stays at 90-91 and no free span is left
+over. What remains resident in `realistic:1` is live small pages, three
+large spans and six medium pages (about 1.5 MB) holding growth-step sizes.
+
 ## Rejected experiments
 
 | run | change | result |
@@ -325,6 +366,8 @@ Source: `bench/results/r1k-summary-2026-10-11T07-06-58-322Z.md`
 | e1 (`ra_e1`) | mimalloc's macOS release path (`MADV_FREE_REUSABLE`) | no RSS gain on `workers:16` (1.16x vs 1.13x), slower (1.07x vs 1.03x wall) |
 | e2 (`ra_e2`) | release spans eagerly on free | `workers:16` RSS unchanged (1.22x), `large:1` 5.1x and `large:4` 3.7x slower |
 | knobs, e1 | upstream `purge_delay` (`RUSTY_ALLOC_PURGE_DELAY=0` or `10`) | RSS 0.70-0.79x on `workers`, but 1.12-1.24x wall there and `large:1` 33x slower: it purges on every free |
+| v2 (perf-coalescing, not committed) | an emptied medium page kept warm forgets its carved blocks so the next allocation re-carves from block 0 | `realistic:1` medium-page resident KiB 1440 -> 1712 (probe, single run): no gain, the medium pages hold several live blocks at once, not one cycling block |
+| `RUSTY_ALLOC_PURGE_DELAY=0` on `realistic:1` | purge every coalesced free span of 8+ slices | RSS 6.57 -> 5.5 MB but +5% instructions and +10% wall; best fit got further (4.3-4.5 MB) for free |
 
 The upstream README advises `purge_delay >= 0` for long-lived services. With
 churning large allocations that is a trap; the resident budget gets the RSS
@@ -332,10 +375,19 @@ without it.
 
 ## Open items
 
-- `realistic:1` max RSS 1.45x mimalloc (6.0 vs 4.1 MB). Not investigated.
-- `xthread:1` wall 1.31x mimalloc (instructions 0.50x). A sample profile is in
-  `bench/results/prof/xthread1.txt`; the hottest frame outside thread waits is
-  `Heap::malloc_generic_once` (24 samples), the slow allocation path on the producer.
+- `realistic:1` max RSS is 1.07x mimalloc after best fit (was 1.45x). The rest
+  is six medium pages (512 KiB each) that each hold a few growth-step blocks.
+- `xthread:1` wall 1.12-1.35x mimalloc across runs (instructions 0.47x,
+  cycles 1.15x). Sample profile: `bench/results/prof/xthread1.txt`. The
+  producer's hot spot (24 of 46 samples) is `page_collect`'s walk of the
+  stolen cross-thread chain (`malloc_generic_once`, the `ldr x12, [x11]`
+  loop), a dependent load per block on lines the consumer core just wrote.
+  mimalloc walks the same chain. False sharing between `xthread_free` and the
+  owner's `free`/`used` in one `Page` is plausible (Apple's line is 128 bytes,
+  a `Page` is 88), but padding is not possible in place: 512 slots of 128 bytes
+  would not fit the 64 KiB header slice. Moving the thread-free heads into
+  their own array in the segment header (4 KiB) is the next experiment; not
+  attempted yet.
 
 ## Reproduce
 

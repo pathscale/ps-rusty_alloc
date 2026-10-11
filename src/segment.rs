@@ -445,7 +445,8 @@ pub fn segment_alloc(arena_id: i32) -> Result<*mut Segment, PrimError> {
                 }
                 FREE_STATE_PURGED_RECOMMIT => {
                     let base = ptr_.add(HEADER_SLICES * SEGMENT_SLICE_SIZE);
-                    if os::commit(base, SEGMENT_SIZE - HEADER_SLICES * SEGMENT_SLICE_SIZE).is_err() {
+                    if os::commit(base, SEGMENT_SIZE - HEADER_SLICES * SEGMENT_SLICE_SIZE).is_err()
+                    {
                         crate::stats::commit_failed();
                     }
                 }
@@ -507,10 +508,10 @@ unsafe fn park_or_purge(seg: *mut Segment) {
         if hw > HEADER_SLICES {
             let base = seg.cast::<u8>().add(HEADER_SLICES * SEGMENT_SLICE_SIZE);
             let bytes = (hw - HEADER_SLICES) * SEGMENT_SLICE_SIZE;
-            if let Ok(recommit) = os::purge(base, bytes, crate::options::is_enabled(5)) {
-                if recommit {
-                    (*seg).ps_free_state = FREE_STATE_PURGED_RECOMMIT;
-                }
+            if let Ok(recommit) = os::purge(base, bytes, crate::options::is_enabled(5))
+                && recommit
+            {
+                (*seg).ps_free_state = FREE_STATE_PURGED_RECOMMIT;
             }
         }
     }

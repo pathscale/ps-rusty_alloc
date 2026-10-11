@@ -1326,6 +1326,10 @@ mod recommit_tests {
     /// assertion fails. The last step checks the span still knows it is
     /// purged, so a later re-commit that succeeds makes it usable again.
     #[test]
+    #[cfg_attr(
+        feature = "debug_checks",
+        ignore = "debug_checks keeps freed blocks in a quarantine, so the core never sees this purge"
+    )]
     fn a_failed_recommit_is_a_failed_span_not_an_unbacked_one() {
         // Serialised with each other (they set the PROCESS-WIDE `purge_delay`)
         // and with the arena adoption tests (they allocate segments, which
@@ -1459,6 +1463,10 @@ mod recommit_tests {
     /// so without carrying the neighbour's flag the decommitted half is
     /// handed out as if it were backed.
     #[test]
+    #[cfg_attr(
+        feature = "debug_checks",
+        ignore = "debug_checks keeps freed blocks in a quarantine, so the core never sees this purge"
+    )]
     fn a_failed_repurge_of_a_merge_keeps_the_span_purged() {
         // Serialised with each other (they set the PROCESS-WIDE `purge_delay`)
         // and with the arena adoption tests (they allocate segments, which
@@ -1484,6 +1492,10 @@ mod recommit_tests {
     /// The same merge with purging switched OFF at runtime after the
     /// neighbour was purged: the merged span is not re-purged at all.
     #[test]
+    #[cfg_attr(
+        feature = "debug_checks",
+        ignore = "debug_checks keeps freed blocks in a quarantine, so the core never sees this purge"
+    )]
     fn a_merge_after_purging_is_turned_off_keeps_the_span_purged() {
         // Serialised with each other (they set the PROCESS-WIDE `purge_delay`)
         // and with the arena adoption tests (they allocate segments, which

@@ -19,6 +19,7 @@
 use core::fmt;
 use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
+pub(crate) mod raw;
 pub mod stack;
 
 pub use stack::StackId;
@@ -32,11 +33,13 @@ pub enum ViolationKind {
     ForeignPointer,
     /// `dealloc` of a block this allocator owns that was not allocated
     /// through [`crate::RustyAlloc`] (the raw `alloc::malloc` / `mi_malloc`
-    /// API, typically the C side of an FFI boundary).
+    /// API, typically the C side of an FFI boundary). The other direction,
+    /// a raw `free` of a `RustyAlloc` block, is allowed, as Scudo allows it
+    /// by default: both reach the same allocator.
     NotFromGlobalAlloc,
-    /// `dealloc` of a pointer into the middle of a block.
+    /// A free of a pointer into the middle of a block.
     InteriorPointer,
-    /// `dealloc` of a block that is already freed (still in quarantine).
+    /// A free of a block that is already freed (still in quarantine).
     DoubleFree,
     /// `dealloc` with a `Layout` size different from the allocation's.
     SizeMismatch,
@@ -360,10 +363,15 @@ impl ThreadDebug {
     }
 }
 
-/// The calling thread's debug state, creating its heap if needed. `None` on
-/// a thread whose heap cannot exist (creation failed, or teardown is over).
+/// The calling thread's debug state. `None` on a thread with no heap (none
+/// created yet, creation failed, or teardown is over).
 fn thread_debug() -> Option<&'static ThreadDebug> {
-    let hb = crate::init::heap_box();
+    // Never bootstrap a heap from here: a free on a thread with no heap yet
+    // (or one already torn down, as in the teardown loop of
+    // `init::thread_done`) is checked and released directly. Creating a heap
+    // during teardown would leave the exit hook pointing at a box that the
+    // same teardown then releases.
+    let hb = crate::init::heap_box_fast();
     if hb.is_null() || hb == crate::init::empty_heap_box_ptr() {
         return None;
     }
@@ -452,7 +460,10 @@ pub const FREED_BYTE: u8 = 0xDF;
 /// Fill of the canary after a block (mimalloc's `MI_DEBUG_PADDING`).
 pub const CANARY_BYTE: u8 = 0xDE;
 
+/// A live block from `RustyAlloc`.
 const LIVE: u32 = 0x4c49_5645;
+/// A live block from the raw API (`crate::alloc`).
+const LIVE_RAW: u32 = 0x4c49_5652;
 const FREED: u32 = 0x4652_4545;
 
 /// The header. A live block is linked into its registry shard through
@@ -536,7 +547,7 @@ unsafe fn read_header(user: *mut u8) -> (State, Header) {
     let h = unsafe { user.sub(HDR).cast::<Header>().read_unaligned() };
     let ok = h.check == checksum(user.addr(), &h);
     let st = match h.state {
-        LIVE if ok => State::Live,
+        LIVE | LIVE_RAW if ok => State::Live,
         FREED if ok => State::Freed,
         _ => State::Bad,
     };
@@ -807,45 +818,70 @@ pub(crate) unsafe fn alloc(layout: core::alloc::Layout, zero: bool) -> *mut u8 {
 /// # Safety
 /// `GlobalAlloc::alloc` contract.
 unsafe fn alloc_at(layout: core::alloc::Layout, zero: bool, st: StackId) -> *mut u8 {
+    // SAFETY: the calling thread's heap; `Layout` alignments are powers of two.
+    unsafe {
+        alloc_block(
+            core::ptr::null_mut(),
+            layout.size(),
+            layout.align(),
+            0,
+            zero,
+            false,
+            st,
+        )
+    }
+}
+
+/// Allocate a debug block of `size` bytes with `(user + offset) % align ==
+/// 0` from `hb` (null: the calling thread's heap): junk or zero fill,
+/// canary, header, linked into the registry. `raw` marks a block of the raw
+/// API. Null on a bad alignment or when the core is out of memory.
+///
+/// # Safety
+/// `hb` is null or a heap box owned by the calling thread.
+unsafe fn alloc_block(
+    hb: *mut crate::init::HeapBox,
+    size: usize,
+    align: usize,
+    offset: usize,
+    zero: bool,
+    raw: bool,
+    st: StackId,
+) -> *mut u8 {
     at_exit_register();
-    let size = layout.size();
-    let align = layout.align();
+    if !align.is_power_of_two() {
+        return core::ptr::null_mut();
+    }
     let Some(total) = size.checked_add(HDR + TRAILER + 15) else {
         return core::ptr::null_mut();
     };
-    let raw = if align <= 16 {
-        // A 16-multiple request lands in a 16-aligned bin, so the user
-        // pointer (`raw + HDR`, HDR a multiple of 16) is 16-aligned as well.
-        let t = total & !15;
-        if zero {
-            crate::alloc::zalloc(t)
+    // SAFETY: per contract.
+    let base = unsafe {
+        if align <= 16 && offset == 0 {
+            // A 16-multiple request lands in a 16-aligned bin, so the user
+            // pointer (`base + HDR`, HDR a multiple of 16) is 16-aligned too.
+            crate::alloc::core_alloc(hb, total & !15, 16, 0)
         } else {
-            crate::alloc::malloc(t)
-        }
-    } else {
-        let t = total - 15;
-        if zero {
-            crate::alloc::zalloc_aligned_at(t, align, HDR)
-        } else {
-            crate::alloc::malloc_aligned_at(t, align, HDR)
+            let Some(at) = offset.checked_add(HDR) else {
+                return core::ptr::null_mut();
+            };
+            crate::alloc::core_alloc(hb, total - 15, align, at)
         }
     };
-    if raw.is_null() {
-        return raw;
+    if base.is_null() {
+        return base;
     }
-    // SAFETY: `raw` holds HDR + size + TRAILER bytes.
+    // SAFETY: `base` holds HDR + size + TRAILER bytes.
     unsafe {
-        let user = raw.add(HDR);
-        if !user.addr().is_multiple_of(align) {
+        let user = base.add(HDR);
+        if !user.addr().wrapping_add(offset).is_multiple_of(align) {
             let mut v = Violation::new(ViolationKind::Misaligned, user.addr());
             v.size = size;
             v.align = align;
             v.stack = st;
             report(&v);
         }
-        if !zero {
-            core::ptr::write_bytes(user, UNINIT_BYTE, size);
-        }
+        core::ptr::write_bytes(user, if zero { 0 } else { UNINIT_BYTE }, size);
         core::ptr::write_bytes(user.add(size), CANARY_BYTE, TRAILER);
         let (seq, tid) = thread_debug().map_or((0, 0), |d| {
             count(d, |c| c.on_alloc(size));
@@ -853,44 +889,56 @@ unsafe fn alloc_at(layout: core::alloc::Layout, zero: bool, st: StackId) -> *mut
             d.seq.set(s);
             (s, thread_no(d))
         });
-        track(user, Header::live(seq, size, align, st, tid));
+        let mut h = Header::live(seq, size, align, st, tid);
+        if raw {
+            h.state = LIVE_RAW;
+        }
+        track(user, h);
         user
     }
 }
 
-/// Check a pointer handed to `dealloc`/`realloc` against `layout`. Reports
-/// every finding; returns the header when the block is ours and may be
-/// released, `None` when releasing it would be unsafe. `st` is the call
-/// site.
+/// What [`inspect`] found at a pointer handed to a free.
+enum Inspect {
+    /// A live debug block; its canary was checked.
+    Block(Header),
+    /// The start of a core block with no debug header: a block from
+    /// `Heap::malloc` and friends, or the debug layer's own core block.
+    Plain,
+    /// Reported; releasing it would be unsafe.
+    Rejected,
+}
+
+/// The checks every free makes, whatever the API: ownership, block start,
+/// header, double free, canary. Reports each finding through `v` (which
+/// carries the caller's pointer, layout and call site).
 ///
 /// # Safety
-/// None beyond `p` being non-null: every read is bounds-checked first.
-unsafe fn validate(p: *mut u8, layout: core::alloc::Layout, st: StackId) -> Option<Header> {
-    let a = p.addr();
-    let mut v = Violation::new(ViolationKind::ForeignPointer, a);
-    v.size = layout.size();
-    v.align = layout.align();
-    v.stack = st;
+/// None beyond `v.ptr` being non-null: every read is bounds-checked first.
+unsafe fn inspect(v: &mut Violation) -> Inspect {
+    let a = v.ptr;
+    let p: *mut u8 = core::ptr::with_exposed_provenance_mut(a);
     if !crate::segment_map::contains(p) {
-        report(&v);
-        return None;
+        v.kind = ViolationKind::ForeignPointer;
+        report(v);
+        return Inspect::Rejected;
     }
     // SAFETY: `p` is in a window we own; reads stay inside its core block.
     unsafe {
         let Some(start) = block_start(p) else {
-            report(&v);
-            return None;
+            v.kind = ViolationKind::ForeignPointer;
+            report(v);
+            return Inspect::Rejected;
         };
         let off = a - start.addr();
+        if off == 0 {
+            return Inspect::Plain;
+        }
         if off < HDR {
-            v.kind = if off == 0 {
-                ViolationKind::NotFromGlobalAlloc
-            } else {
-                ViolationKind::InteriorPointer
-            };
+            v.kind = ViolationKind::InteriorPointer;
             v.offset = off;
-            report(&v);
-            return None;
+            report(v);
+            return Inspect::Rejected;
         }
         let (state, h) = locked_read(p);
         match state {
@@ -898,8 +946,8 @@ unsafe fn validate(p: *mut u8, layout: core::alloc::Layout, st: StackId) -> Opti
             State::Freed => {
                 v.kind = ViolationKind::DoubleFree;
                 v.block(&h);
-                report(&v);
-                return None;
+                report(v);
+                return Inspect::Rejected;
             }
             State::Bad => {
                 // A debug block whose header sits at the start of this core
@@ -917,24 +965,55 @@ unsafe fn validate(p: *mut u8, layout: core::alloc::Layout, st: StackId) -> Opti
                     v.offset = a - u.addr();
                     v.block(&uh);
                 }
-                report(&v);
-                return None;
+                report(v);
+                return Inspect::Rejected;
             }
         }
         v.block(&h);
-        if h.size as usize != layout.size() {
-            v.kind = ViolationKind::SizeMismatch;
-            report(&v);
-        } else if h.align() != layout.align() {
-            v.kind = ViolationKind::AlignMismatch;
-            report(&v);
-        }
         if let Some(i) = first_not(p.add(h.size as usize), CANARY_BYTE, TRAILER) {
             v.kind = ViolationKind::BufferOverflow;
             v.offset = h.size as usize + i;
-            report(&v);
+            report(v);
         }
-        Some(h)
+        Inspect::Block(h)
+    }
+}
+
+/// Check a pointer handed to `dealloc`/`realloc` against `layout`. Reports
+/// every finding; returns the header when the block is ours and may be
+/// released, `None` when releasing it would be unsafe. `st` is the call
+/// site.
+///
+/// # Safety
+/// None beyond `p` being non-null: every read is bounds-checked first.
+unsafe fn validate(p: *mut u8, layout: core::alloc::Layout, st: StackId) -> Option<Header> {
+    let mut v = Violation::new(ViolationKind::ForeignPointer, p.addr());
+    v.size = layout.size();
+    v.align = layout.align();
+    v.stack = st;
+    // SAFETY: forwarded.
+    match unsafe { inspect(&mut v) } {
+        Inspect::Rejected => None,
+        Inspect::Plain => {
+            v.kind = ViolationKind::NotFromGlobalAlloc;
+            report(&v);
+            None
+        }
+        Inspect::Block(h) if h.state == LIVE_RAW => {
+            v.kind = ViolationKind::NotFromGlobalAlloc;
+            report(&v);
+            None
+        }
+        Inspect::Block(h) => {
+            if h.size as usize != layout.size() {
+                v.kind = ViolationKind::SizeMismatch;
+                report(&v);
+            } else if h.align() != layout.align() {
+                v.kind = ViolationKind::AlignMismatch;
+                report(&v);
+            }
+            Some(h)
+        }
     }
 }
 

@@ -70,6 +70,10 @@ fn free_list_survives_heavy_churn() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "debug_checks",
+    ignore = "debug_checks keeps freed blocks in a quarantine behind a header, which changes the reuse and layout this checks"
+)]
 #[cfg(not(miri))] // guard pages need real OS protection
 fn guarded_objects_are_protected() {
     let h = init::create_heap(0, true, -1);

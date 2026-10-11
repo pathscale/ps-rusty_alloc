@@ -10,6 +10,10 @@ unsafe fn hmalloc(hb: *mut HeapBox, n: usize) -> *mut u8 {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "debug_checks",
+    ignore = "debug_checks keeps freed blocks in a quarantine behind a header, which changes the reuse and layout this checks"
+)]
 fn heaps_arenas_subprocs_options() {
     // --- first-class heap: alloc, cross-heap free routing, delete-migrate ---
     let h1 = init::create_heap(7, false, -1);
@@ -284,6 +288,10 @@ fn exclusive_arena_confines_huge_allocations() {
 /// So: allocate past the first bitmap word. With the half-narrowed code the
 /// scan stops at word 0 and the exclusive heap reports its arena full.
 #[test]
+#[cfg_attr(
+    feature = "debug_checks",
+    ignore = "debug_checks keeps freed blocks in a quarantine behind a header, which changes the reuse and layout this checks"
+)]
 fn arena_bitmap_reaches_past_its_first_word() {
     use rusty_alloc::types::{LARGE_OBJ_SIZE_MAX, SEGMENT_SIZE};
 
@@ -349,6 +357,10 @@ fn arena_bitmap_reaches_past_its_first_word() {
 /// A private heap, so the bin under test holds exactly one page and nothing
 /// else in the process can add a second.
 #[test]
+#[cfg_attr(
+    feature = "debug_checks",
+    ignore = "debug_checks keeps freed blocks in a quarantine behind a header, which changes the reuse and layout this checks"
+)]
 fn collect_reclaims_a_bins_last_page() {
     for force in [false, true] {
         let h = init::create_heap(0, true, -1);
@@ -377,6 +389,10 @@ fn collect_reclaims_a_bins_last_page() {
 /// so a heap never collected on its own no matter how long it ran. The option is
 /// lowered here so the test does not have to make 10,000 slow-path trips.
 #[test]
+#[cfg_attr(
+    feature = "debug_checks",
+    ignore = "debug_checks keeps freed blocks in a quarantine behind a header, which changes the reuse and layout this checks"
+)]
 fn generic_collect_fires_on_its_own() {
     let prev = options::get(options::GENERIC_COLLECT);
     options::set(options::GENERIC_COLLECT, 8);

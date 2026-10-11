@@ -74,6 +74,10 @@ fn calloc_overflow_returns_null() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "debug_checks",
+    ignore = "debug_checks keeps freed blocks in a quarantine behind a header, which changes the reuse and layout this checks"
+)]
 fn block_reuse_same_size_class() {
     // Freeing then reallocating the same class must recycle memory (sharded
     // free lists working) — observed via the address coming back.
@@ -455,5 +459,27 @@ fn realloc_storm() {
             assert_eq!(p.add(size - 1).read(), tag);
             free(p);
         }
+    }
+}
+
+/// A thread whose last act is a raw free exits cleanly. In `debug_checks`
+/// builds the raw API goes through the debug layer, and thread teardown frees
+/// through it too: the debug layer must not create a heap there, or the exit
+/// hook is left pointing at a box the same teardown releases.
+#[test]
+fn a_thread_that_used_the_raw_api_exits_cleanly() {
+    for _ in 0..4 {
+        std::thread::spawn(|| {
+            let p = malloc(64);
+            let q = malloc(1 << 20);
+            assert!(!p.is_null() && !q.is_null());
+            // SAFETY: live blocks from malloc, each freed once.
+            unsafe {
+                free(q);
+                free(p);
+            }
+        })
+        .join()
+        .unwrap();
     }
 }

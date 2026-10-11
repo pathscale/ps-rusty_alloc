@@ -14,6 +14,10 @@ use rusty_alloc::types::SEGMENT_SLICE_SIZE;
 const TWO_MIB: usize = 2 * SEGMENT_SLICE_SIZE;
 
 #[test]
+#[cfg_attr(
+    feature = "debug_checks",
+    ignore = "debug_checks keeps freed blocks in a quarantine behind a header, which changes the reuse and layout this checks"
+)]
 fn same_size_reuses_the_span_other_sizes_do_not_and_collect_flushes() {
     // Same size: the very same block comes back, no span carved for it.
     let a = malloc(TWO_MIB);

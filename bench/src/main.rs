@@ -322,6 +322,10 @@ fn main() {
     let a: Vec<String> = std::env::args().collect();
     let wl = a.get(1).map(String::as_str).unwrap_or("small");
     let t: usize = a.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
+    // BENCH_PROFILE_SLEEP_MS: pause before work so a sampler can attach.
+    if let Some(ms) = std::env::var("BENCH_PROFILE_SLEEP_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+        thread::sleep(std::time::Duration::from_millis(ms));
+    }
     let start = Instant::now();
     // second value = ops per thread, for ns_op normalisation
     let (chk, ops): (u64, u64) = match wl {

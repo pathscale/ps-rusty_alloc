@@ -434,6 +434,75 @@ fn workers(t: usize) -> u64 {
     chk
 }
 
+/// Huge blocks over parked chunks: each round, `t` threads build ~4 MB and
+/// exit (their chunks go back to the arena, up to the budget parked
+/// resident), then the main thread takes three 80 MB huge blocks, which
+/// claim runs of those freed chunks, and writes 0x01 over the first 4 KiB of
+/// every chunk inside them, where a Normal segment header would sit. With
+/// BENCH_WAVE_RSS, prints the parked-resident counter and the number of
+/// chunks actually parked after each phase; the two must agree.
+fn hugepark(t: usize) -> u64 {
+    const HUGE: usize = 80 << 20;
+    const CHUNK: usize = 32 << 20;
+    let probe = std::env::var_os("BENCH_WAVE_RSS").is_some();
+    let mut chk = 0u64;
+    for round in 0..6u64 {
+        let hs: Vec<_> = (0..t as u64)
+            .map(|id| {
+                thread::spawn(move || {
+                    let v: Vec<Vec<u8>> =
+                        (0..16_000u64).map(|i| vec![(i ^ id) as u8; 256]).collect();
+                    v.iter().map(|b| b[0] as u64).sum::<u64>()
+                })
+            })
+            .collect();
+        for h in hs {
+            chk = chk.wrapping_add(h.join().unwrap());
+        }
+        if probe {
+            park_probe(round, "threads_exited");
+        }
+        let mut blocks = Vec::new();
+        for _ in 0..3 {
+            let p = unsafe { alloc(Layout::from_size_align_unchecked(HUGE, 8)) };
+            if p.is_null() {
+                eprintln!("alloc failed size={HUGE}");
+                std::process::exit(2);
+            }
+            let mut o = (CHUNK - (p as usize) % CHUNK) % CHUNK;
+            while o + 4096 <= HUGE {
+                unsafe { std::ptr::write_bytes(p.add(o), 1, 4096) };
+                o += CHUNK;
+            }
+            unsafe { *p = round as u8 };
+            blocks.push(p);
+        }
+        if probe {
+            park_probe(round, "huge_live");
+        }
+        for p in blocks {
+            unsafe {
+                chk = chk.wrapping_add(*p as u64);
+                dealloc(p, Layout::from_size_align_unchecked(HUGE, 8));
+            }
+        }
+    }
+    chk
+}
+
+fn park_probe(round: u64, phase: &str) {
+    #[cfg(feature = "rusty_alloc")]
+    {
+        let (counter, bits) = rusty_alloc::arena::parked_resident();
+        eprintln!(
+            "round={round} {phase} parked_counter={counter} parked_chunks={bits} maxrss_mb={:.1}",
+            maxrss_mb()
+        );
+    }
+    #[cfg(not(feature = "rusty_alloc"))]
+    eprintln!("round={round} {phase} maxrss_mb={:.1}", maxrss_mb());
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let wl = a.get(1).map(String::as_str).unwrap_or("small");
@@ -482,6 +551,8 @@ fn main() {
         "phases" => (par(t, phases), 8),
         // (h) worker waves: 8 waves of t threads, each builds ~24MB of maps/strings, drops, exits
         "workers" => (workers(t), 8),
+        // (i) huge blocks claiming parked arena chunks, see `hugepark`
+        "hugepark" => (hugepark(t), 6),
         // (e) 4KB..1MB, 32 live per thread, touch every page
         "large" => {
             let ops = 200_000;

@@ -41,8 +41,26 @@ from the environment and off unless set:
   BENCH_PROFILE_SLEEP_MS=300 bench/bin/rusty_alloc xthread 1 & sample $! 5 -f out.txt
   ```
 
-Library side, the only addition is the `Segment::ps_free_state` header byte
-used by the resident budget ([resident-budget.md](resident-budget.md)).
+- `BENCH_SEG_PROBE=1`, `rusty_alloc` build, any workload. At the end of the
+  run (and on the last `realistic` iteration, before its maps drop) it dumps
+  every heap's segments: high-water slice, free spans, live pages by kind
+  (small `s<used>/<reserved>`, medium `m<slices>:<used>/<reserved>`, large
+  `L<slices>`, free `F<slices>`), each prefixed by its resident KiB from
+  `mincore`, plus resident totals for free, large, small and medium spans.
+  `BENCH_SEG_PROBE_HW=1` prints the high-water slice and peak RSS after every
+  `realistic` iteration. This is what showed the `realistic` fragmentation.
+
+  ```sh
+  BENCH_SEG_PROBE=1 bench/bin/rusty_alloc realistic 1
+  ```
+
+- `hugepark` workload with `BENCH_WAVE_RSS=1`: prints the parked-chunk
+  counter against the number of chunks actually parked
+  ([resident-budget.md](resident-budget.md)).
+
+Library side: `arena::parked_resident()` returns that pair. The resident
+budget's state is kept in two arena bitmaps (`parked`, `decommitted`); see
+[resident-budget.md](resident-budget.md).
 
 ## Planned, not implemented
 
@@ -76,5 +94,3 @@ Performance and fragmentation:
   `global_asm!` for x86-64 Linux, Windows and aarch64 Linux TLS and owner checks.
   Keep, or replace with a non-asm thread id.
 - `RESIDENT_FREE_BUDGET`: 8 (current) or 2 (lower RSS, slower).
-- Chunks parked by the resident budget and then taken by the Huge path
-  (`arena::chunk_alloc_n`) are not settled; see [resident-budget.md](resident-budget.md#known-gap).

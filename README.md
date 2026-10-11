@@ -1,3 +1,40 @@
+# ps-rusty_alloc
+
+Pathscale fork of [rusty_alloc](https://github.com/remade-with-rust/rusty_alloc) 2.2.6,
+a pure-Rust remake of mimalloc. Imported from the crates.io 2.2.6 tarball, which
+matches upstream commit `61ae839`. No upstream git history is carried; the first
+commit here is the pristine import.
+
+The package is `ps-rusty_alloc`; its library remains `rusty_alloc`. It is not
+published (`publish = false`).
+
+Changes in this fork:
+
+- Bounded freed-but-resident arena chunks (`RESIDENT_FREE_BUDGET = 8` in
+  `src/segment.rs`). Peak RSS under waves of short-lived threads drops from
+  1.21-1.24x mimalloc to 1.01x. See [docs/resident-budget.md](docs/resident-budget.md).
+- A standalone benchmark crate in [bench/](bench/README.md), the only place
+  the C mimalloc appears. Results and methodology: [docs/benchmarks.md](docs/benchmarks.md).
+- `LICENSE` keeps the upstream MIT text and copyright; the upstream note about
+  vendored `oracle/` and `corpus/` trees is dropped because this repo carries neither.
+
+Debugging and visibility, what exists upstream, what was added and what is
+planned: [docs/debugging.md](docs/debugging.md).
+
+CI is manual (`workflow_dispatch`). The gate is the local run:
+
+```sh
+cargo build
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+cargo test
+cd bench && bun build.ts && bun run.ts 1 mimalloc,rusty_alloc tasks:1,small:1 smoke
+```
+
+The upstream README follows.
+
+---
+
 > **In the wild** — [RAG Converter](https://ragconverter.com) uses `rusty_alloc` as the allocator, in wasm too.
 > It makes personal and work files AI-readable without them leaving the machine:
 > the whole conversion runs as WebAssembly in the browser tab, with nothing

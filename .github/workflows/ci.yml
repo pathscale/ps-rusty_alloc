@@ -17,3 +17,15 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo fmt --check
       - run: cargo test --release
+      # no_std on unix: multi-threaded, no cfg needed (docs/no_std.md).
+      - run: cargo clippy --no-default-features -- -D warnings
+      - run: cargo clippy --no-default-features --features debug_checks -- -D warnings
+      - run: cargo clippy --no-default-features -- -D warnings
+        env:
+          RUSTFLAGS: --cfg ra_single_threaded
+      # The no_std multi-threaded proof binary, compared with its fixture.
+      # The full run (four builds, 50 runs each, nm check) is bench/nostd.ts.
+      - run: cargo build --release
+        working-directory: bench/nostd-mt
+      - run: ./target/release/nostd-mt | cmp - ../fixtures/nostd_mt.expected
+        working-directory: bench/nostd-mt

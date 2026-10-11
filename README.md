@@ -43,6 +43,17 @@ Changes in this fork:
   with a report by default; `debug::set_handler` changes that. The
   performance build's machine code is unchanged. See
   [docs/debugging.md](docs/debugging.md).
+- `no_std` and multi-threaded on unix (macOS, Linux): thread-locals are
+  pthread keys, so `default-features = false` needs no `--cfg` and any number
+  of threads is sound; nothing from Rust `std` is linked, with
+  `panic = "abort"` or `panic = "unwind"` (internal checks abort through
+  `libc::abort`, and `RustyAlloc` never unwinds). Proven by `bench/nostd-mt`,
+  a `#![no_std]` binary churning 2.56 M blocks over 128 pthreads, with an `nm`
+  check for std symbols. See [docs/no_std.md](docs/no_std.md):
+
+  ```toml
+  ps-rusty_alloc = { version = "2.3.2", default-features = false }
+  ```
 - A standalone benchmark crate in [bench/](bench/README.md), the only place
   the C mimalloc appears. Results and methodology: [docs/benchmarks.md](docs/benchmarks.md).
 - `LICENSE` keeps the upstream MIT text and copyright; the upstream note about
@@ -59,8 +70,11 @@ The gate is the local run:
 cargo build
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
+cargo clippy --no-default-features -- -D warnings
+cargo clippy --no-default-features --features debug_checks -- -D warnings
 cargo test
 cd bench && bun build.ts && bun run.ts 1 mimalloc,rusty_alloc tasks:1,small:1 smoke
+bun fixtures.ts && bun nostd.ts   # still in bench/
 ```
 
 The upstream README follows.

@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `no_std` and multi-threaded on unix (macOS, Linux): without `std`, the
+  thread-locals are pthread keys (`src/key_local.rs`), so
+  `default-features = false` builds with no `--cfg` and is sound with any
+  number of threads; heaps are abandoned and reclaimed at thread exit exactly
+  as with `std`. `--cfg ra_single_threaded` stays as the opt-in for one
+  thread, and is still required on targets without an OS. See
+  `docs/no_std.md`.
+- `bench/nostd-mt`, `bench/nostd.ts` and `bench/nostd-nm.ts`: a `#![no_std]`
+  binary with 128 pthreads, run 50 times in four builds (`panic = "abort"`,
+  debug assertions, `debug_checks`, `panic = "unwind"`) against a fixture, and
+  an `nm` check that it links nothing from `std`.
+
+### Changed
+
+- Without `std` on unix: `abort` is `libc::abort` (it was a panic), the
+  stderr fallback is `write(2)`, the heap CSPRNG is seeded from `getentropy`,
+  options are read from the environment, and debug mode's at-exit report is
+  registered with `atexit`.
+- Without `std`, internal checks (debug assertions, `debug_checks` free and
+  segment checks) report and abort instead of panicking, and every
+  `RustyAlloc` method aborts rather than unwind if anything inside it panics,
+  so a consumer built with `panic = "unwind"` never unwinds through the
+  allocator. The `std` build's machine code is unchanged.
+- A `no_std` build without 64-bit atomics must opt into
+  `ra_single_threaded` (it used to split them silently).
+
 ## 2.3.1 - 2026-10-11
 
 ### Added

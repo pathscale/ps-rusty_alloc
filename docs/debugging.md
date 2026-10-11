@@ -67,6 +67,10 @@ budget's state is kept in two arena bitmaps (`parked`, `decommitted`); see
 
 ## Debug mode (`debug_checks`)
 
+It works the same in a `no_std` multi-threaded build on unix: reports go to
+fd 2 through `write(2)` when no output hook is registered, and the default
+handler ends in `libc::abort` ([no_std.md](no_std.md)).
+
 One allocator for both modes. `debug_checks` (upstream's feature, extended
 here rather than a new name) switches [`RustyAlloc`](../src/global.rs) to a
 checked implementation in [`src/debug.rs`](../src/debug.rs); without it that

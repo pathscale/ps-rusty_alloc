@@ -534,6 +534,15 @@ pub fn for_each_heap(f: &mut dyn FnMut(&crate::heap::Heap)) {
     heaps_unlock();
 }
 
+/// Debug mode: run `f` with the head of the heap registry, under its lock.
+/// `f` must not allocate, create or release a heap.
+#[cfg(feature = "debug_checks")]
+pub(crate) fn debug_locked(f: &mut dyn FnMut(*mut HeapBox)) {
+    heaps_lock();
+    f(HEAPS_HEAD.load(Ordering::Acquire));
+    heaps_unlock();
+}
+
 /// Get (or create) the calling thread's heap box. NULL when creation fails
 /// (memory exhaustion) — callers translate that into their own failure value
 /// (a null allocation, a no-op collect); the TLS slot keeps the sentinel so a

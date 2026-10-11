@@ -415,12 +415,18 @@ unsafe fn scrub_recycled(seg: *mut Segment, slots: usize, owner_table: bool) {
 /// and register it in the segment map.
 pub fn segment_alloc(arena_id: i32) -> Result<*mut Segment, PrimError> {
     let (ptr_, size, mem_zero) = match crate::arena::chunk_alloc(arena_id) {
-        Some((p, zero)) => (p, SEGMENT_SIZE, zero),
+        Some((p, zero)) => {
+            #[cfg(feature = "debug_checks")]
+            crate::debug::count_chunk(crate::debug::Chunk::ArenaClaim);
+            (p, SEGMENT_SIZE, zero)
+        }
         None => {
             if arena_id >= 0 {
                 return Err(0); // exclusive-arena heap and its arena is full
             }
             let (p, sz, zero) = reserve_backing(SEGMENT_SIZE)?;
+            #[cfg(feature = "debug_checks")]
+            crate::debug::count_chunk(crate::debug::Chunk::OsReserve);
             (p, sz, zero)
         }
     };
@@ -482,9 +488,13 @@ const RESIDENT_FREE_BUDGET: usize = 8;
 unsafe fn park_or_purge(seg: *mut Segment) -> crate::arena::ChunkState {
     use crate::arena::{ChunkState, PARKED_RESIDENT};
     if PARKED_RESIDENT.fetch_add(1, Ordering::Relaxed) < RESIDENT_FREE_BUDGET {
+        #[cfg(feature = "debug_checks")]
+        crate::debug::count_chunk(crate::debug::Chunk::Park);
         return ChunkState::Parked;
     }
     PARKED_RESIDENT.fetch_sub(1, Ordering::Relaxed);
+    #[cfg(feature = "debug_checks")]
+    crate::debug::count_chunk(crate::debug::Chunk::Purge);
     // SAFETY: per contract; the range lies inside the segment.
     unsafe {
         let hw = (*seg).next_free_slice as usize;
@@ -1096,12 +1106,18 @@ pub fn huge_alloc(
         return Err(0);
     };
     let (bptr, total, mem_zero) = match crate::arena::chunk_alloc_n(arena_id, chunks) {
-        Some((p, zero)) => (p, chunk_bytes, zero),
+        Some((p, zero)) => {
+            #[cfg(feature = "debug_checks")]
+            crate::debug::count_chunk(crate::debug::Chunk::ArenaClaim);
+            (p, chunk_bytes, zero)
+        }
         None => {
             if arena_id >= 0 {
                 return Err(0); // exclusive-arena heap and its arena is full
             }
             let (p, sz, zero) = reserve_backing(want)?;
+            #[cfg(feature = "debug_checks")]
+            crate::debug::count_chunk(crate::debug::Chunk::OsReserve);
             (p, sz, zero)
         }
     };

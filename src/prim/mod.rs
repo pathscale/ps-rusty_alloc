@@ -217,7 +217,7 @@ pub fn numa_node_count() -> usize {
 /// itself, so `options.rs` keeps a `std::env` fallback for those.
 #[cfg(all(any(windows, unix), not(miri)))]
 pub fn getenv(name: &[u8], out: &mut [u8]) -> Option<usize> {
-    debug_assert_eq!(name.last(), Some(&0), "getenv: name must be NUL-terminated");
+    ra_debug_assert_eq!(name.last(), Some(&0), "getenv: name must be NUL-terminated");
     if name.last() != Some(&0) || out.is_empty() {
         return None;
     }

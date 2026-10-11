@@ -138,6 +138,187 @@ compile_error!(
      is multi-threaded and needs neither. See docs/no_std.md."
 );
 
+// Internal assertions. With `std` these are `assert!` and `debug_assert!`,
+// token for token, so a std build is unchanged. Without `std` a failed check
+// reports and aborts through [`fatal`] instead of panicking: upstream's
+// `mi_assert` ends in `abort()` too, and a panic inside the allocator would
+// otherwise unwind through its half-updated state into a consumer built with
+// `panic = "unwind"`.
+
+/// `assert!`, aborting rather than panicking without `std`.
+macro_rules! ra_assert {
+    ($c:expr $(,)?) => {
+        ra_assert!($c, "assertion failed: {}", stringify!($c))
+    };
+    ($c:expr, $($arg:tt)+) => {{
+        #[cfg(feature = "std")]
+        {
+            assert!($c, $($arg)+);
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            if !$c {
+                $crate::fatal(file!(), line!(), format_args!($($arg)+));
+            }
+        }
+    }};
+}
+
+/// `assert_eq!`, aborting rather than panicking without `std`.
+#[allow(unused_macros)] // only debug_checks and no_std builds use it
+macro_rules! ra_assert_eq {
+    ($a:expr, $b:expr $(,)?) => {
+        ra_assert_eq!($a, $b, "{} == {}", stringify!($a), stringify!($b))
+    };
+    ($a:expr, $b:expr, $($arg:tt)+) => {{
+        #[cfg(feature = "std")]
+        {
+            assert_eq!($a, $b, $($arg)+);
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            match (&$a, &$b) {
+                (l, r) => {
+                    if !(*l == *r) {
+                        $crate::fatal(
+                            file!(),
+                            line!(),
+                            format_args!("{} (left: {:?}, right: {:?})", format_args!($($arg)+), l, r),
+                        );
+                    }
+                }
+            }
+        }
+    }};
+}
+
+/// `assert_ne!`, aborting rather than panicking without `std`.
+#[allow(unused_macros)] // only no_std builds use it
+macro_rules! ra_assert_ne {
+    ($a:expr, $b:expr $(,)?) => {
+        ra_assert_ne!($a, $b, "{} != {}", stringify!($a), stringify!($b))
+    };
+    ($a:expr, $b:expr, $($arg:tt)+) => {{
+        #[cfg(feature = "std")]
+        {
+            assert_ne!($a, $b, $($arg)+);
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            match (&$a, &$b) {
+                (l, r) => {
+                    if *l == *r {
+                        $crate::fatal(
+                            file!(),
+                            line!(),
+                            format_args!("{} (both: {:?})", format_args!($($arg)+), l),
+                        );
+                    }
+                }
+            }
+        }
+    }};
+}
+
+/// `debug_assert!`: [`ra_assert!`] in builds with debug assertions.
+macro_rules! ra_debug_assert {
+    ($($t:tt)+) => {{
+        #[cfg(feature = "std")]
+        {
+            debug_assert!($($t)+);
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            if cfg!(debug_assertions) {
+                ra_assert!($($t)+);
+            }
+        }
+    }};
+}
+
+/// `debug_assert_eq!`: [`ra_assert_eq!`] in builds with debug assertions.
+macro_rules! ra_debug_assert_eq {
+    ($($t:tt)+) => {{
+        #[cfg(feature = "std")]
+        {
+            debug_assert_eq!($($t)+);
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            if cfg!(debug_assertions) {
+                ra_assert_eq!($($t)+);
+            }
+        }
+    }};
+}
+
+/// `debug_assert_ne!`: [`ra_assert_ne!`] in builds with debug assertions.
+macro_rules! ra_debug_assert_ne {
+    ($($t:tt)+) => {{
+        #[cfg(feature = "std")]
+        {
+            debug_assert_ne!($($t)+);
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            if cfg!(debug_assertions) {
+                ra_assert_ne!($($t)+);
+            }
+        }
+    }};
+}
+
+/// A failed internal check without `std`: one line to stderr (or the output
+/// hook), then [`abort`]. Formats into a stack buffer; never allocates and
+/// never unwinds.
+#[cfg(not(feature = "std"))]
+#[cold]
+#[inline(never)]
+pub(crate) fn fatal(file: &str, line: u32, msg: core::fmt::Arguments<'_>) -> ! {
+    struct Buf {
+        b: [u8; 512],
+        n: usize,
+    }
+    impl core::fmt::Write for Buf {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let room = self.b.len() - self.n;
+            let mut k = s.len().min(room);
+            while !s.is_char_boundary(k) {
+                k -= 1;
+            }
+            self.b[self.n..self.n + k].copy_from_slice(&s.as_bytes()[..k]);
+            self.n += k;
+            Ok(())
+        }
+    }
+    let mut b = Buf { b: [0; 512], n: 0 };
+    let _ = core::fmt::write(
+        &mut b,
+        format_args!("rusty_alloc: internal check failed at {file}:{line}: {msg}\n"),
+    );
+    options::out_fmt(
+        core::str::from_utf8(&b.b[..b.n]).unwrap_or("rusty_alloc: internal check failed\n"),
+    );
+    abort()
+}
+
+/// Abort if dropped: armed around each `GlobalAlloc` call without `std`, so
+/// that a panic raised anywhere inside the allocator (a bounds check, an
+/// overflow check in a debug build, a hook) can never unwind out of it into a
+/// consumer built with `panic = "unwind"`. The normal return `forget`s it.
+/// With `panic = "abort"` there are no unwind edges, so it compiles to
+/// nothing.
+#[cfg(not(feature = "std"))]
+pub(crate) struct NoUnwind;
+
+#[cfg(not(feature = "std"))]
+impl Drop for NoUnwind {
+    #[cold]
+    fn drop(&mut self) {
+        abort()
+    }
+}
+
 /// The single-thread arm of [`ra_thread_local!`]: a `static` with a `.with()`.
 #[cfg(any(
     all(not(feature = "std"), any(not(unix), ra_single_threaded)),

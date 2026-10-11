@@ -182,7 +182,7 @@ fn slot_get(key: libc::pthread_key_t) -> *mut c_void {
         // every valid key; `key` is a valid key.
         let v = unsafe { tsd.add(key as usize).read() };
         // SAFETY: as `set`.
-        debug_assert!(v == unsafe { libc::pthread_getspecific(key) });
+        ra_debug_assert!(v == unsafe { libc::pthread_getspecific(key) });
         v
     }
     #[cfg(all(target_vendor = "apple", target_arch = "x86_64", not(miri)))]
@@ -195,7 +195,7 @@ fn slot_get(key: libc::pthread_key_t) -> *mut c_void {
                              v = out(reg) v, options(nostack, preserves_flags, readonly));
         }
         // SAFETY: as `set`.
-        debug_assert!(v == unsafe { libc::pthread_getspecific(key) });
+        ra_debug_assert!(v == unsafe { libc::pthread_getspecific(key) });
         v
     }
     #[cfg(not(all(

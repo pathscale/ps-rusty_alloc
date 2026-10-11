@@ -146,7 +146,7 @@ pub const fn empty_heap_box_ptr() -> *mut HeapBox {
 /// `xheap` must be a live HeapBox's delayed-list address (nonzero).
 #[inline]
 pub unsafe fn box_of_xheap(xheap: usize) -> *mut HeapBox {
-    debug_assert!(xheap != 0);
+    ra_debug_assert!(xheap != 0);
     xheap as *mut HeapBox
 }
 
@@ -948,7 +948,7 @@ pub unsafe fn heap_delete(hb: *mut HeapBox) {
     }
     // SAFETY: owner thread per contract; absorb everything into backing.
     unsafe {
-        debug_assert_eq!((*hb).owner_tid, thread_id());
+        ra_debug_assert_eq!((*hb).owner_tid, thread_id());
         let h = &mut *(*hb).heap.get();
         let bh = &mut *(*backing).heap.get();
         // Teardown: this heap is being deleted, so it must not adopt orphans.
@@ -992,7 +992,7 @@ pub unsafe fn heap_destroy(hb: *mut HeapBox) {
             heap_delete(hb);
             return;
         }
-        debug_assert_eq!((*hb).owner_tid, thread_id());
+        ra_debug_assert_eq!((*hb).owner_tid, thread_id());
         let h = &mut *(*hb).heap.get();
         // Spin out any in-flight FREEING remotes before the box dies; blocks
         // they queued are dying with the heap, so the delayed list is simply
@@ -1219,7 +1219,7 @@ fn abandoned_push(seg: *mut Segment, sp: usize) {
     if crate::ONE_THREAD {
         unreachable!("a segment was abandoned on a build that asserted a single thread");
     }
-    debug_assert!(sp < MAX_SUBPROCS);
+    ra_debug_assert!(sp < MAX_SUBPROCS);
     // PURGE BEFORE ORPHANING (`abandoned_page_purge`, on by default). Until
     // some other thread adopts this segment it has no owner, so every page it
     // touched stays resident for an unbounded time and nothing can reuse it.

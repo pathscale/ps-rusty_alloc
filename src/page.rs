@@ -805,7 +805,7 @@ pub unsafe fn remote_free(page: *mut Page, block: *mut Block) {
                     // the heap down (it spins us out first) — xheap is valid.
                     unsafe {
                         let dl = (*page).xheap.load(Ordering::Acquire) as *const DelayedList;
-                        debug_assert!(!dl.is_null(), "DELAYED page without an owner heap");
+                        ra_debug_assert!(!dl.is_null(), "DELAYED page without an owner heap");
                         loop {
                             let head = (*dl).head.load(Ordering::Acquire);
                             // A block that is already the list head is being
@@ -1228,7 +1228,7 @@ pub unsafe fn page_extend(page: *mut Page, area: *mut u8) {
         // same line already holds live. Nothing arrives to replace what
         // leaves, which is why this is the only one of the three that made
         // cfrac faster (-1,500 Ir).
-        debug_assert!(
+        ra_debug_assert!(
             (*page).slice_count.is_power_of_two(),
             "extend bound assumes a power-of-two span, got {}",
             (*page).slice_count

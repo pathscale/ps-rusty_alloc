@@ -149,7 +149,7 @@ pub fn alloc_aligned(
     } else {
         a.ptr as usize
     };
-    debug_assert!(
+    ra_debug_assert!(
         crate::bins::is_aligned_to(from_origin, alignment),
         "prim returned misaligned block"
     );

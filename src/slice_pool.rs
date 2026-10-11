@@ -76,7 +76,7 @@ pub fn free_range(base: usize, size: usize) -> bool {
     for idx in start..end {
         let (w, b) = bit(idx);
         let prev = FREE[w].fetch_or(b, Ordering::Relaxed);
-        debug_assert_eq!(prev & b, 0, "slice pool: double free of slice {idx}");
+        ra_debug_assert_eq!(prev & b, 0, "slice pool: double free of slice {idx}");
     }
     true
 }

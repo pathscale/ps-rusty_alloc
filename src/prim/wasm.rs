@@ -83,7 +83,7 @@ pub(super) unsafe fn alloc(
         return Err(WERR);
     }
     let base = prev * WASM_PAGE;
-    debug_assert_eq!(base, cur, "memory grew under us in a single-threaded build");
+    ra_debug_assert_eq!(base, cur, "memory grew under us in a single-threaded build");
 
     Ok(Alloc {
         // Freshly grown linear memory is specified to be zero, and because

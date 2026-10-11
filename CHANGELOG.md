@@ -12,6 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `RustyAlloc`: a `GlobalAlloc` front end in the crate (`src/global.rs`), the
   same routing as `rusty_alloc-api` 2.2.6. Its machine code in the benchmark
   binary is byte-identical to the bench shim it replaces.
+- Debug mode (`debug_checks`): `RustyAlloc` checks every free (foreign and
+  raw-API pointers, interior pointers, double frees, size and alignment
+  mismatches, overflows, header corruption), poisons freed blocks into a
+  per-thread quarantine (1 MiB) and checks them on eviction, fills fresh
+  blocks with `0xD0`; `rusty_alloc::debug` adds `set_handler`, `leak_report`,
+  `stats`, `fragmentation_report` and the report at exit with `show_stats`.
+  Off, the performance build is byte-identical.
 
 ## [2.2.6](https://github.com/Remade-With-Rust/rusty_alloc/compare/rusty_alloc-v2.2.5...rusty_alloc-v2.2.6) - 2026-10-09
 

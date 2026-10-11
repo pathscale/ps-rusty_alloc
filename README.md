@@ -34,13 +34,22 @@ Changes in this fork:
   #[global_allocator]
   static GLOBAL: rusty_alloc::RustyAlloc = rusty_alloc::RustyAlloc;
   ```
+- Debug mode on `RustyAlloc` behind upstream's `debug_checks` feature: header
+  checksums and canaries catch foreign and raw-API frees (FFI mismatches),
+  interior pointers, double frees, layout mismatches and overflows; freed
+  blocks are poisoned in a 1 MiB per-thread quarantine to catch writes after
+  free; `debug::leak_report`, `debug::stats` (per size class, realloc
+  patterns, huge and chunk churn) and `debug::fragmentation_report`. Aborts
+  with a report by default; `debug::set_handler` changes that. The
+  performance build's machine code is unchanged. See
+  [docs/debugging.md](docs/debugging.md).
 - A standalone benchmark crate in [bench/](bench/README.md), the only place
   the C mimalloc appears. Results and methodology: [docs/benchmarks.md](docs/benchmarks.md).
 - `LICENSE` keeps the upstream MIT text and copyright; the upstream note about
   vendored `oracle/` and `corpus/` trees is dropped because this repo carries neither.
 
-Debugging and visibility, what exists upstream, what was added and what is
-planned: [docs/debugging.md](docs/debugging.md).
+Debugging and visibility, what exists upstream, what was added, the survey it
+follows and what was left out: [docs/debugging.md](docs/debugging.md).
 
 CI and publishing are manual (`workflow_dispatch`). The version in `Cargo.toml`
 is the release: a version bump merged to `master` is published from that commit.

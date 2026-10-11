@@ -251,12 +251,21 @@ impl fmt::Write for Line {
 pub(crate) struct ThreadDebug {
     /// Allocation number of the last block this thread allocated.
     seq: core::cell::Cell<u64>,
+    /// Quarantine FIFO of freed blocks (user pointers), linked through
+    /// their headers, oldest first.
+    q_head: core::cell::Cell<*mut u8>,
+    q_tail: core::cell::Cell<*mut u8>,
+    /// Bytes (requested sizes) in the quarantine.
+    q_bytes: core::cell::Cell<usize>,
 }
 
 impl ThreadDebug {
     pub(crate) const fn new() -> Self {
         Self {
             seq: core::cell::Cell::new(0),
+            q_head: core::cell::Cell::new(core::ptr::null_mut()),
+            q_tail: core::cell::Cell::new(core::ptr::null_mut()),
+            q_bytes: core::cell::Cell::new(0),
         }
     }
 }
@@ -526,16 +535,136 @@ unsafe fn validate(p: *mut u8, layout: core::alloc::Layout) -> Option<Header> {
     }
 }
 
-/// Hand a validated block back.
+// ---------------------------------------------------------------------------
+// Quarantine (delayed free)
+// ---------------------------------------------------------------------------
+
+/// Default quarantine budget per thread, in bytes.
+pub const QUARANTINE_DEFAULT: usize = 1 << 20;
+
+/// Per-thread quarantine budget; `usize::MAX` until first resolved.
+static QUARANTINE_LIMIT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Set the per-thread quarantine budget in bytes (0 turns the quarantine
+/// off). Takes effect on each thread's next free.
+pub fn set_quarantine_limit(bytes: usize) {
+    QUARANTINE_LIMIT.store(bytes.min(usize::MAX - 1), Ordering::Relaxed);
+}
+
+/// The per-thread quarantine budget: [`set_quarantine_limit`], else the
+/// environment variable `RUSTY_ALLOC_DEBUG_QUARANTINE_KIB`, else
+/// [`QUARANTINE_DEFAULT`].
+pub fn quarantine_limit() -> usize {
+    let l = QUARANTINE_LIMIT.load(Ordering::Relaxed);
+    if l != usize::MAX {
+        return l;
+    }
+    let mut l = QUARANTINE_DEFAULT;
+    #[cfg(all(any(windows, unix), not(miri)))]
+    {
+        let mut buf = [0u8; 24];
+        if let Some(n) = crate::prim::getenv(b"RUSTY_ALLOC_DEBUG_QUARANTINE_KIB\0", &mut buf)
+            && let Some(kib) = core::str::from_utf8(&buf[..n.min(buf.len())])
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok())
+        {
+            l = kib.saturating_mul(1024).min(usize::MAX - 1);
+        }
+    }
+    QUARANTINE_LIMIT.store(l, Ordering::Relaxed);
+    l
+}
+
+/// Hand a validated block back: poison it and park it in this thread's
+/// quarantine, releasing the oldest blocks past the budget.
 ///
 /// # Safety
 /// `p` passed [`validate`], which returned `h`.
 unsafe fn release(p: *mut u8, h: Header) {
-    // SAFETY: per contract the block is ours and live.
+    // SAFETY: per contract the block is ours and live until handed on.
     unsafe {
+        core::ptr::write_bytes(p, FREED_BYTE, h.size);
         write_header(p, 0, h.size, h.align as usize, FREED);
+        let limit = quarantine_limit();
+        let Some(d) = thread_debug().filter(|_| h.size <= limit) else {
+            crate::alloc::free(p.sub(HDR));
+            return;
+        };
+        // The link lives in the header's `seq` word, outside the checksum of
+        // a FREED header.
+        p.sub(HDR)
+            .cast::<*mut u8>()
+            .write_unaligned(core::ptr::null_mut());
+        let tail = d.q_tail.get();
+        if tail.is_null() {
+            d.q_head.set(p);
+        } else {
+            tail.sub(HDR).cast::<*mut u8>().write_unaligned(p);
+        }
+        d.q_tail.set(p);
+        d.q_bytes.set(d.q_bytes.get() + h.size);
+        while d.q_bytes.get() > limit && evict_one(d) {}
+    }
+}
+
+/// Release the oldest quarantined block after checking its poison and
+/// canary. False when the quarantine is empty.
+fn evict_one(d: &ThreadDebug) -> bool {
+    let p = d.q_head.get();
+    if p.is_null() {
+        return false;
+    }
+    // SAFETY: quarantined blocks are ours and stay allocated in the core
+    // until this call frees them.
+    unsafe {
+        let (st, h) = read_header(p);
+        if st != State::Freed {
+            // The header (and with it the link) was overwritten: report and
+            // abandon the rest of the queue rather than follow a bad link.
+            let v = Violation::new(ViolationKind::CorruptHeader, p.addr());
+            d.q_head.set(core::ptr::null_mut());
+            d.q_tail.set(core::ptr::null_mut());
+            d.q_bytes.set(0);
+            report(&v);
+            return true;
+        }
+        let next = p.sub(HDR).cast::<*mut u8>().read_unaligned();
+        d.q_head.set(next);
+        if next.is_null() {
+            d.q_tail.set(core::ptr::null_mut());
+        }
+        d.q_bytes.set(d.q_bytes.get().saturating_sub(h.size));
+        let hit = first_not(p, FREED_BYTE, h.size)
+            .or_else(|| first_not(p.add(h.size), CANARY_BYTE, TRAILER).map(|i| h.size + i));
+        if let Some(off) = hit {
+            let mut v = Violation::new(ViolationKind::UseAfterFree, p.addr());
+            v.block_size = h.size;
+            v.block_align = h.align as usize;
+            v.offset = off;
+            report(&v);
+        }
         crate::alloc::free(p.sub(HDR));
     }
+    true
+}
+
+/// Check and release every block in the calling thread's quarantine.
+pub fn flush_quarantine() {
+    if let Some(d) = thread_debug() {
+        while evict_one(d) {}
+    }
+}
+
+/// Thread teardown: empty the dying thread's quarantine while its heap is
+/// still live.
+///
+/// # Safety
+/// `hb` is the calling thread's live heap box.
+pub(crate) unsafe fn thread_done(hb: *mut crate::init::HeapBox) {
+    // SAFETY: per contract.
+    let d = unsafe { &(*hb).dbg };
+    while evict_one(d) {}
 }
 
 /// Debug `GlobalAlloc::dealloc`.

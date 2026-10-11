@@ -272,6 +272,13 @@ fn phases(seed: u64) -> u64 {
     chk.wrapping_add(keep.len() as u64)
 }
 
+/// Peak RSS so far (getrusage; bytes on macOS).
+fn maxrss_mb() -> f64 {
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+    ru.ru_maxrss as f64 / 1048576.0
+}
+
 fn workers(t: usize) -> u64 {
     let mut chk = 0u64;
     for wave in 0..8u64 {
@@ -297,6 +304,16 @@ fn workers(t: usize) -> u64 {
         }
         // main thread keeps a little state between waves, like a coordinator
         chk = chk.wrapping_add(realistic(1, wave));
+        if std::env::var_os("BENCH_WAVE_RSS").is_some() {
+            eprintln!("wave={} maxrss_mb={:.1}", wave, maxrss_mb());
+            #[cfg(feature = "rusty_alloc")]
+            {
+                let ab = rusty_alloc::init::ABANDONED_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+                let mut line = String::new();
+                rusty_alloc::arena::arenas_print(&mut |s: &str| line.push_str(s.trim()));
+                eprintln!("  abandoned_segments={} {}", ab, line);
+            }
+        }
     }
     chk
 }

@@ -17,6 +17,7 @@ smmalloc = { version = "7.6.13", optional = true }
 baby-mimalloc = { version = "0.2.1", optional = true, features = ["mmap", "spin_mutex"] }
 rlsf = { version = "0.2.3", optional = true }
 dlmalloc = { version = "0.2.14", optional = true, features = ["global"] }
+libc = "0.2"
 
 [features]
 system = []

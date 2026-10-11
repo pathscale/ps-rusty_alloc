@@ -7,13 +7,13 @@ mod ra_shim;
 
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::HashMap;
-use std::hint::black_box;
-use std::sync::mpsc;
-use std::thread;
 use std::future::Future;
+use std::hint::black_box;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::task::{Context, Poll, Waker};
+use std::thread;
 use std::time::Instant;
 
 #[cfg(feature = "mimalloc")]
@@ -115,7 +115,9 @@ fn par<F: Fn(u64) -> u64 + Sync>(threads: usize, f: F) -> u64 {
     thread::scope(|s| {
         let f = &f;
         let hs: Vec<_> = (0..threads).map(|t| s.spawn(move || f(t as u64))).collect();
-        hs.into_iter().map(|h| h.join().unwrap()).fold(0, u64::wrapping_add)
+        hs.into_iter()
+            .map(|h| h.join().unwrap())
+            .fold(0, u64::wrapping_add)
     })
 }
 
@@ -158,7 +160,9 @@ fn xthread(pairs: usize, per_pair: u64) -> u64 {
             chk
         }));
     }
-    hs.into_iter().map(|h| h.join().unwrap()).fold(0, u64::wrapping_add)
+    hs.into_iter()
+        .map(|h| h.join().unwrap())
+        .fold(0, u64::wrapping_add)
 }
 
 /// Build and drop String/Vec/HashMap structures, like a parser or indexer would.
@@ -194,8 +198,16 @@ fn realistic(iters: u64, seed: u64) -> u64 {
 type Task = Pin<Box<dyn Future<Output = usize>>>;
 
 fn work(input: &[u8], salt: u64) -> usize {
-    let v: Vec<u8> = input.iter().map(|b| b.wrapping_add(salt as u8)).filter(|b| (*b & 1) == 0).collect();
-    let s: String = v.iter().take(24).map(|b| char::from(b"abcdefghijklmnop"[(*b & 15) as usize])).collect();
+    let v: Vec<u8> = input
+        .iter()
+        .map(|b| b.wrapping_add(salt as u8))
+        .filter(|b| (*b & 1) == 0)
+        .collect();
+    let s: String = v
+        .iter()
+        .take(24)
+        .map(|b| char::from(b"abcdefghijklmnop"[(*b & 15) as usize]))
+        .collect();
     v.len() + s.len()
 }
 
@@ -227,21 +239,23 @@ fn mk_task(r: u64, input: Arc<[u8]>) -> Task {
 
 fn tasks(ops: u64, seed: u64, slots: usize) -> u64 {
     let mut rng = Rng(seed ^ 0x51ED_2701_DEAD_BEEF);
-    let mut pool: Vec<Arc<[u8]>> = (0..256u64).map(|i| (0..16 + i).map(|x| x as u8).collect()).collect();
+    let mut pool: Vec<Arc<[u8]>> = (0..256u64)
+        .map(|i| (0..16 + i).map(|x| x as u8).collect())
+        .collect();
     let mut ring: Vec<Option<Task>> = (0..slots).map(|_| None).collect();
     let mut cx = Context::from_waker(Waker::noop());
     let mut chk = 0u64;
     for i in 0..ops {
         let r = rng.next();
         let idx = (r % slots as u64) as usize;
-        if let Some(mut f) = ring[idx].take() {
-            if let Poll::Ready(n) = f.as_mut().poll(&mut cx) {
-                chk = chk.wrapping_add(n as u64);
-            }
+        if let Some(mut f) = ring[idx].take()
+            && let Poll::Ready(n) = f.as_mut().poll(&mut cx)
+        {
+            chk = chk.wrapping_add(n as u64);
         }
         let input = pool[((r >> 16) % 256) as usize].clone();
         ring[idx] = Some(mk_task(r, input));
-        if (r >> 8) % 16 == 0 {
+        if (r >> 8).is_multiple_of(16) {
             let j = ((r >> 24) % 256) as usize;
             let len = 16 + (r >> 32) % 240;
             pool[j] = (0..len).map(|x| (x ^ i) as u8).collect();
@@ -260,7 +274,7 @@ fn phases(seed: u64) -> u64 {
         let n = (64 << 20) / sz;
         let mut v: Vec<Option<Vec<u8>>> = (0..n).map(|i| Some(vec![i as u8; sz])).collect();
         for slot in v.iter_mut() {
-            if rng.next() % 10 != 0 {
+            if !rng.next().is_multiple_of(10) {
                 *slot = None;
             }
         }
@@ -308,7 +322,8 @@ fn workers(t: usize) -> u64 {
             eprintln!("wave={} maxrss_mb={:.1}", wave, maxrss_mb());
             #[cfg(feature = "rusty_alloc")]
             {
-                let ab = rusty_alloc::init::ABANDONED_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+                let ab =
+                    rusty_alloc::init::ABANDONED_COUNT.load(std::sync::atomic::Ordering::Relaxed);
                 let mut line = String::new();
                 rusty_alloc::arena::arenas_print(&mut |s: &str| line.push_str(s.trim()));
                 eprintln!("  abandoned_segments={} {}", ab, line);
@@ -323,7 +338,10 @@ fn main() {
     let wl = a.get(1).map(String::as_str).unwrap_or("small");
     let t: usize = a.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
     // BENCH_PROFILE_SLEEP_MS: pause before work so a sampler can attach.
-    if let Some(ms) = std::env::var("BENCH_PROFILE_SLEEP_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+    if let Some(ms) = std::env::var("BENCH_PROFILE_SLEEP_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
         thread::sleep(std::time::Duration::from_millis(ms));
     }
     let start = Instant::now();
@@ -332,7 +350,12 @@ fn main() {
         // (a)/(b) small mixed 16..255B, 1024 live per thread
         "small" => {
             let ops = 20_000_000;
-            (par(t, move |id| churn(ops, 1024, 16, 255, 0x1234 + id * 7919, false)), ops)
+            (
+                par(t, move |id| {
+                    churn(ops, 1024, 16, 255, 0x1234 + id * 7919, false)
+                }),
+                ops,
+            )
         }
         // (c) cross-thread free, t = producer/consumer pairs
         "xthread" => {
@@ -355,13 +378,18 @@ fn main() {
             (par(t, move |id| tasks(ops, id, 262_144)), ops)
         }
         // (g) size-class phases: 8 phases x 64MB of one size; 90% freed randomly, 10% survive
-        "phases" => (par(t, move |id| phases(id)), 8),
+        "phases" => (par(t, phases), 8),
         // (h) worker waves: 8 waves of t threads, each builds ~24MB of maps/strings, drops, exits
         "workers" => (workers(t), 8),
         // (e) 4KB..1MB, 32 live per thread, touch every page
         "large" => {
             let ops = 200_000;
-            (par(t, move |id| churn(ops, 32, 4096, 1 << 20, 0xBEEF + id, true)), ops)
+            (
+                par(t, move |id| {
+                    churn(ops, 32, 4096, 1 << 20, 0xBEEF + id, true)
+                }),
+                ops,
+            )
         }
         _ => {
             eprintln!("unknown workload {wl}");

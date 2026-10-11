@@ -43,7 +43,11 @@ unsafe impl GlobalAlloc for RustyAlloc {
     #[inline]
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         if layout.align() <= NATURAL_ALIGN {
-            let new_size = if layout.align() <= WORD { new_size } else { new_size.max(NATURAL_ALIGN) };
+            let new_size = if layout.align() <= WORD {
+                new_size
+            } else {
+                new_size.max(NATURAL_ALIGN)
+            };
             unsafe {
                 core::hint::assert_unchecked(!ptr.is_null());
                 rusty_alloc::alloc::realloc(ptr, new_size)

@@ -19,16 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-This repository vendors third-party code for DEVELOPMENT USE ONLY. None of it
-is a runtime dependency and none of it is published to crates.io:
-
-  * oracle/mimalloc          - Microsoft mimalloc, MIT. The differential
-                               oracle every gate compares against.
-  * corpus/mimalloc-bench    - daanx/mimalloc-bench, MIT. The 1:1 benchmark
-                               corpus.
-
-Both live outside every published package directory and are excluded from
-`cargo package` output. See their own LICENSE files for terms.

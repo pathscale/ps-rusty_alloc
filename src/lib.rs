@@ -8,8 +8,9 @@
 //! segment reclaim. No global lock anywhere on the alloc/free paths.
 //!
 //! std note: M4's TLS fast path uses `thread_local!` (const-init, !Drop — the
-//! R1 spike measured it at atomic-load parity). A no_std profile returns
-//! post-v1 with the nightly `#[thread_local]` or a platform TLS shim.
+//! R1 spike measured it at atomic-load parity). Without `std` on unix the
+//! thread-locals are pthread keys and the crate is fully multi-threaded; see
+//! `docs/no_std.md`.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![deny(missing_docs)]
@@ -56,73 +57,90 @@ pub(crate) fn abort() -> ! {
     }
 }
 
-/// A `thread_local!` that survives `no_std` — the single-heap profile.
+/// A `thread_local!` that survives `no_std`. Three arms, by build:
 ///
-/// With `std` this expands to `std::thread_local!` unchanged, so the shipped
-/// build keeps the const-init, `!Drop`, initial-exec fast path M10c measured.
+/// * **`std`**: expands to `std::thread_local!` unchanged, so the shipped
+///   build keeps the const-init, `!Drop`, initial-exec fast path M10c
+///   measured.
+/// * **`no_std` on unix** (macOS, Linux, the BSDs): a [`key_local::KeyLocal`],
+///   one pthread key per variable. Sound with any number of threads; no
+///   `std`, no allocation, no nightly feature. This is the multi-threaded
+///   `no_std` profile (`docs/no_std.md`).
+/// * **single thread**: a plain `static` ([`SingleThreadCell`]). Taken by a
+///   `no_std` build that opts in with `--cfg ra_single_threaded` (required
+///   where there is no OS, optional on unix), and by `wasm32-unknown-unknown`
+///   without the atomics proposal, which has exactly one thread.
 ///
-/// Without it there is no thread-local storage and, on the targets this crate
-/// serves without `std`, no second thread either: `prim::fixed::thread_id`
-/// returns a constant and its TLS is a fixed table whose destructors never run,
-/// because there is no thread exit. So a "thread-local" becomes a plain
-/// `static` — which is not a compromise but the point of the profile: one heap,
-/// no TLS lookup at all, a SHORTER fast path than the threaded one.
-/// **`wasm32-unknown-unknown` takes the single-`static` arm too, not just
-/// `no_std`.** That target has exactly one thread unless the atomics+threads
-/// proposal is on, which `prim/wasm.rs` has assumed since it was written. A
-/// `std::thread_local!` there still links lazy initialisation, destructor
-/// registration and the "accessed during or after destruction" panic — none of
-/// which can ever run — and the strings for it ship in every module.
+/// The single-thread arm is not a compromise but the point of that profile:
+/// one heap, no TLS lookup at all, a SHORTER fast path than the threaded one.
+/// On `wasm32-unknown-unknown` a `std::thread_local!` would still link lazy
+/// initialisation, destructor registration and the "accessed during or after
+/// destruction" panic, none of which can ever run. `target_feature =
+/// "atomics"` is the precise switch: it is what `-C target-feature=+atomics`
+/// sets to build wasm WITH threads, and such a build keeps real TLS.
 ///
-/// `target_feature = "atomics"` is the precise switch: it is what
-/// `-C target-feature=+atomics` sets to build wasm WITH threads, and such a
-/// build keeps real TLS.
+/// Every variable is a `Cell` of one word (`bool`, `usize` or a pointer),
+/// accessed only as `.with(|c| c.get())` and `.with(|c| c.set(v))`, which all
+/// three arms provide.
 macro_rules! ra_thread_local {
-    ($($(#[$m:meta])* static $N:ident: $T:ty = const $init:block;)*) => {
+    ($($(#[$m:meta])* static $N:ident: Cell<$T:ty> = const { Cell::new($init:expr) };)*) => {
         #[cfg(all(feature = "std", not(all(target_arch = "wasm32", target_os = "unknown", not(target_feature = "atomics")))))]
         std::thread_local! {
-            $($(#[$m])* static $N: $T = const $init;)*
+            $($(#[$m])* static $N: Cell<$T> = const { Cell::new($init) };)*
         }
         $(
-            #[cfg(any(not(feature = "std"), all(target_arch = "wasm32", target_os = "unknown", not(target_feature = "atomics"))))]
+            #[cfg(all(not(feature = "std"), unix, not(ra_single_threaded)))]
             $(#[$m])*
-            static $N: $crate::SingleThreadCell<$T> =
-                $crate::SingleThreadCell::new($init);
+            static $N: $crate::key_local::KeyLocal<$T> =
+                $crate::key_local::KeyLocal::new(Cell::new($init));
+        )*
+        $(
+            #[cfg(any(all(not(feature = "std"), any(not(unix), ra_single_threaded)), all(target_arch = "wasm32", target_os = "unknown", not(target_feature = "atomics"))))]
+            $(#[$m])*
+            static $N: $crate::SingleThreadCell<Cell<$T>> =
+                $crate::SingleThreadCell::new(Cell::new($init));
         )*
     };
 }
 
-// The `no_std` build asserts single-threadedness, so it must be OPTED INTO.
+// A `no_std` build on a target with no OS asserts single-threadedness, so it
+// must be OPTED INTO.
 //
-// Three things in a `no_std` build are sound only because there is exactly one
-// thread: [`SingleThreadCell`]'s `unsafe impl Sync`, `prim::fixed`'s constant
-// thread id and never-contended spin lock, and `options`' 64-bit atomics split
-// into `AtomicU32` halves. None of them is checkable at compile time, and none
-// of them fails loudly if the assumption breaks — they corrupt quietly.
+// Three things are sound there only because there is exactly one thread:
+// [`SingleThreadCell`]'s `unsafe impl Sync`, `prim::fixed`'s constant thread
+// id and never-contended spin lock, and `options`' 64-bit atomics split into
+// `AtomicU32` halves where the target has no 64-bit atomics. None of them is
+// checkable at compile time, and none of them fails loudly if the assumption
+// breaks: they corrupt quietly.
 //
-// A doc comment is not a guard. `no_std` here therefore requires
+// A doc comment is not a guard. Such a build therefore requires
 // `--cfg ra_single_threaded`, so that using this allocator on a bare-metal
 // target is a decision somebody wrote down rather than a default they
-// inherited. There is no cost to it and no way around it:
+// inherited:
 //
 // ```text
 // RUSTFLAGS="--cfg ra_single_threaded" cargo build --no-default-features
 // ```
 //
-// If your target has more than one thread touching the allocator, do not set
-// it — enable the `std` feature instead, or the port is not done.
-#[cfg(all(not(feature = "std"), not(ra_single_threaded), not(doc)))]
+// On unix none of the three applies without that cfg: thread-locals are
+// pthread keys ([`key_local`]), the thread id is the thread pointer
+// (`init::thread_id`), the locks are the hosted ones, and the 64-bit atomics
+// are native (and refused below where they are not). So a `no_std` build on
+// unix is multi-threaded by default and needs no cfg; `ra_single_threaded`
+// there remains an explicit opt-in to the single-`static` thread-locals.
+#[cfg(all(not(feature = "std"), not(unix), not(ra_single_threaded), not(doc)))]
 compile_error!(
-    "rusty_alloc's no_std build assumes a SINGLE THREAD (SingleThreadCell's \
-     `unsafe impl Sync`, prim::fixed's constant thread id and spin lock, and \
-     options' split 64-bit atomics all depend on it). Confirm that is true of \
-     your target and opt in with `--cfg ra_single_threaded`, or enable the \
-     `std` feature. See the crate docs on SingleThreadCell."
+    "rusty_alloc's no_std build on a target without an OS assumes a SINGLE \
+     THREAD (SingleThreadCell's `unsafe impl Sync`, prim::fixed's constant \
+     thread id and spin lock, and options' split 64-bit atomics all depend on \
+     it). Confirm that is true of your target and opt in with \
+     `--cfg ra_single_threaded`, or enable the `std` feature. no_std on unix \
+     is multi-threaded and needs neither. See docs/no_std.md."
 );
 
-/// The single-thread half of [`ra_thread_local!`]: a `static` with a `.with()`.
+/// The single-thread arm of [`ra_thread_local!`]: a `static` with a `.with()`.
 #[cfg(any(
-    not(feature = "std"),
+    all(not(feature = "std"), any(not(unix), ra_single_threaded)),
     all(
         target_arch = "wasm32",
         target_os = "unknown",
@@ -132,26 +150,27 @@ compile_error!(
 pub(crate) struct SingleThreadCell<T>(T);
 
 #[cfg(any(
-    not(feature = "std"),
+    all(not(feature = "std"), any(not(unix), ra_single_threaded)),
     all(
         target_arch = "wasm32",
         target_os = "unknown",
         not(target_feature = "atomics")
     )
 ))]
-// SAFETY: only ever constructed by `ra_thread_local!`, and only on a target
-// this crate serves single-threaded: a `no_std` build (which must opt in with
-// `--cfg ra_single_threaded`), or `wasm32-unknown-unknown` without the atomics
-// proposal, where `prim/wasm.rs` has assumed one thread since it was written.
-// The same standing assumption as `prim::fixed` (constant thread id, TLS
-// destructors that never fire, a spin lock that never contends). With one
-// thread there is no other referent, so shared access cannot race. A build on a
-// target that grows threads must revisit this type FIRST — which is what the
+// SAFETY: only ever constructed by `ra_thread_local!`, and only on a build
+// that is single-threaded by declaration: a `no_std` build that opted in with
+// `--cfg ra_single_threaded` (required without an OS, a choice on unix), or
+// `wasm32-unknown-unknown` without the atomics proposal, where `prim/wasm.rs`
+// has assumed one thread since it was written. The same standing assumption
+// as `prim::fixed` (constant thread id, TLS destructors that never fire, a
+// spin lock that never contends). With one thread there is no other
+// referent, so shared access cannot race. A build on a target that grows
+// threads must revisit this type FIRST, which is what the
 // `target_feature = "atomics"` half of the condition above is there to catch.
 unsafe impl<T> Sync for SingleThreadCell<T> {}
 
 #[cfg(any(
-    not(feature = "std"),
+    all(not(feature = "std"), any(not(unix), ra_single_threaded)),
     all(
         target_arch = "wasm32",
         target_os = "unknown",
@@ -297,6 +316,9 @@ pub mod debug;
 pub mod global;
 pub mod heap;
 pub mod init;
+/// Thread-locals as pthread keys: the multi-threaded `no_std` profile on unix.
+#[cfg(all(not(feature = "std"), unix, not(ra_single_threaded)))]
+mod key_local;
 pub mod options;
 pub mod os;
 pub mod page;

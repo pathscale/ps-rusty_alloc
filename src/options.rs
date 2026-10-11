@@ -31,6 +31,21 @@ use core::sync::atomic::{AtomicI64, AtomicU64};
 use portable_atomic::{AtomicI64, AtomicU64};
 #[cfg(all(not(target_has_atomic = "64"), not(feature = "std")))]
 use split64::{AtomicI64, AtomicU64};
+// The halves are sound only with one thread. A `no_std` build on unix is
+// multi-threaded unless it opts out, so a unix target without 64-bit atomics
+// must say `--cfg ra_single_threaded` or enable `std` (and its shim).
+#[cfg(all(
+    not(target_has_atomic = "64"),
+    not(feature = "std"),
+    not(ra_single_threaded),
+    not(doc)
+))]
+compile_error!(
+    "rusty_alloc: this target has no 64-bit atomics, and the no_std \
+     multi-threaded build needs them for options. Enable the `std` feature \
+     (portable-atomic), or opt into a single thread with \
+     `--cfg ra_single_threaded`."
+);
 
 /// A 64-bit atomic as two `AtomicU32` halves, for single-threaded `no_std`.
 ///

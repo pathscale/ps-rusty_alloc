@@ -1,0 +1,27 @@
+uninit_fill: true
+zeroed: true
+overaligned: true
+clean_frees: none
+buffer_overflow: buffer_overflow size=24 align=8 block_size=24 block_align=8 offset=24
+double_free: double_free size=40 align=8 block_size=40 block_align=8 offset=0
+size_mismatch: size_mismatch size=48 align=8 block_size=64 block_align=8 offset=0
+align_mismatch: align_mismatch size=64 align=16 block_size=64 block_align=8 offset=0
+foreign_pointer: foreign_pointer size=32 align=8 block_size=0 block_align=0 offset=0
+not_from_global_alloc: not_from_global_alloc size=32 align=8 block_size=0 block_align=0 offset=0
+interior_pointer: interior_pointer size=48 align=8 block_size=64 block_align=8 offset=16
+corrupt_header: corrupt_header size=64 align=8 block_size=0 block_align=0 offset=0
+use_after_free: use_after_free size=0 align=0 block_size=48 block_align=8 offset=8
+realloc_stale_write: use_after_free size=0 align=0 block_size=16 block_align=8 offset=0
+stats_bin_40: block_size=48 allocs=1000 frees=500 live_bytes=20000 waste_bytes=4000
+stats_realloc: reallocs=6 grows=5 shrinks=1 small_grows=3 ping_pongs=2
+stats_huge: allocs=2 frees=2 same_size_repeats=1
+stats_chunks_counted: true
+fragmentation_consistent: true
+stats_exited_thread: allocs=10 frees=10
+leaks_after_mark: [10, 200, 5000]
+leak_summary_counts_them: true
+at_exit_report: true
+guarded_overflow_faults: true
+default_handler_stdout: ""
+default_handler_stderr: "rusty_alloc: error: double free of block 0xADDR (size 40, align 8)\n"
+default_handler_signal: Some(6)

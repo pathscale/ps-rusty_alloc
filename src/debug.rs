@@ -257,6 +257,8 @@ pub(crate) struct ThreadDebug {
     q_tail: core::cell::Cell<*mut u8>,
     /// Bytes (requested sizes) in the quarantine.
     q_bytes: core::cell::Cell<usize>,
+    /// Counters, merged across threads only when a report asks.
+    c: core::cell::UnsafeCell<DebugStats>,
 }
 
 impl ThreadDebug {
@@ -266,6 +268,7 @@ impl ThreadDebug {
             q_head: core::cell::Cell::new(core::ptr::null_mut()),
             q_tail: core::cell::Cell::new(core::ptr::null_mut()),
             q_bytes: core::cell::Cell::new(0),
+            c: core::cell::UnsafeCell::new(DebugStats::new()),
         }
     }
 }
@@ -445,6 +448,7 @@ pub(crate) unsafe fn alloc(layout: core::alloc::Layout, zero: bool) -> *mut u8 {
         }
         core::ptr::write_bytes(user.add(size), CANARY_BYTE, TRAILER);
         let seq = thread_debug().map_or(0, |d| {
+            count(d, |c| c.on_alloc(size));
             let s = d.seq.get() + 1;
             d.seq.set(s);
             s
@@ -587,6 +591,9 @@ unsafe fn release(p: *mut u8, h: Header) {
     unsafe {
         core::ptr::write_bytes(p, FREED_BYTE, h.size);
         write_header(p, 0, h.size, h.align as usize, FREED);
+        if let Some(d) = thread_debug() {
+            count(d, |c| c.on_free(h.size));
+        }
         let limit = quarantine_limit();
         let Some(d) = thread_debug().filter(|_| h.size <= limit) else {
             crate::alloc::free(p.sub(HDR));
@@ -666,6 +673,8 @@ pub(crate) unsafe fn thread_done(hb: *mut crate::init::HeapBox) {
     // SAFETY: per contract.
     let d = unsafe { &(*hb).dbg };
     while evict_one(d) {}
+    // SAFETY: per contract.
+    unsafe { retire_counters(hb) };
 }
 
 /// Debug `GlobalAlloc::dealloc`.
@@ -698,6 +707,9 @@ pub(crate) unsafe fn realloc(p: *mut u8, layout: core::alloc::Layout, new_size: 
             return np;
         }
         core::ptr::copy_nonoverlapping(p, np, h.size.min(new_size));
+        if let Some(d) = thread_debug() {
+            count(d, |c| c.on_realloc(h.size, new_size));
+        }
         release(p, h);
         np
     }
@@ -843,4 +855,414 @@ fn at_exit_register() {
 /// the first 16 leaks.
 pub fn print_report() {
     print_leaks(16);
+    print_stats();
+}
+
+// ---------------------------------------------------------------------------
+// Statistics
+// ---------------------------------------------------------------------------
+
+use crate::bins::BIN_COUNT;
+
+/// Counters of one size class (mimalloc's bins; the class of the REQUESTED
+/// size, i.e. the bin the performance build would use).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BinStats {
+    /// Block size of the class (0 for the huge class).
+    pub block_size: usize,
+    /// Allocations.
+    pub allocs: u64,
+    /// Frees.
+    pub frees: u64,
+    /// Requested bytes live now.
+    pub live_bytes: i64,
+    /// Highest `live_bytes` seen (merged: the largest of any thread).
+    pub peak_bytes: i64,
+    /// Bytes lost to size-class rounding on the live blocks (block size
+    /// minus requested size, as the performance build would pay).
+    pub waste_bytes: i64,
+}
+
+/// Debug-mode counters, per thread and merged by [`stats`]. Byte counts are
+/// signed: a block freed on another thread than the one that allocated it
+/// lowers the freeing thread's count, and only the merged sum is exact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DebugStats {
+    /// Per size class, indexed by bin.
+    pub bins: [BinStats; BIN_COUNT],
+    /// Allocations through `RustyAlloc`.
+    pub allocs: u64,
+    /// Frees through `RustyAlloc`.
+    pub frees: u64,
+    /// Requested bytes live now.
+    pub live_bytes: i64,
+    /// Highest `live_bytes` (merged: the largest of any thread).
+    pub peak_bytes: i64,
+    /// Size-class rounding waste of the live blocks.
+    pub waste_bytes: i64,
+    /// `realloc` calls.
+    pub reallocs: u64,
+    /// Reallocs that grew the block.
+    pub realloc_grows: u64,
+    /// Reallocs that shrank it.
+    pub realloc_shrinks: u64,
+    /// Grows by at most max(16 bytes, 1/8 of the old size): the
+    /// grow-one-step-at-a-time pattern that a reserve would avoid.
+    pub realloc_small_grows: u64,
+    /// Reallocs that undid the previous realloc on the same thread
+    /// (A to B, then B to A).
+    pub realloc_ping_pongs: u64,
+    /// Allocations above `LARGE_OBJ_SIZE_MAX`, each its own OS mapping or
+    /// arena chunks.
+    pub huge_allocs: u64,
+    /// Frees of those.
+    pub huge_frees: u64,
+    /// Huge allocations of exactly the size this thread last freed: map,
+    /// unmap, map again.
+    pub huge_repeats: u64,
+    /// Segments and huge blocks claimed from arena chunks.
+    pub arena_claims: u64,
+    /// Segments and huge blocks reserved fresh from the OS.
+    pub os_reserves: u64,
+    /// Freed chunks kept resident under the resident budget.
+    pub chunk_parks: u64,
+    /// Freed chunks purged because the budget was full.
+    pub chunk_purges: u64,
+    /// Threads whose counters are in this total (live and exited).
+    pub threads: u64,
+    last_old: usize,
+    last_new: usize,
+    last_huge_free: usize,
+}
+
+const BIN_ZERO: BinStats = BinStats {
+    block_size: 0,
+    allocs: 0,
+    frees: 0,
+    live_bytes: 0,
+    peak_bytes: 0,
+    waste_bytes: 0,
+};
+
+impl DebugStats {
+    const fn new() -> Self {
+        Self {
+            bins: [BIN_ZERO; BIN_COUNT],
+            allocs: 0,
+            frees: 0,
+            live_bytes: 0,
+            peak_bytes: 0,
+            waste_bytes: 0,
+            reallocs: 0,
+            realloc_grows: 0,
+            realloc_shrinks: 0,
+            realloc_small_grows: 0,
+            realloc_ping_pongs: 0,
+            huge_allocs: 0,
+            huge_frees: 0,
+            huge_repeats: 0,
+            arena_claims: 0,
+            os_reserves: 0,
+            chunk_parks: 0,
+            chunk_purges: 0,
+            threads: 0,
+            last_old: 0,
+            last_new: 0,
+            last_huge_free: 0,
+        }
+    }
+
+    fn on_alloc(&mut self, size: usize) {
+        let b = crate::bins::bin(size);
+        let waste = if size > crate::types::MEDIUM_OBJ_SIZE_MAX {
+            0
+        } else {
+            (crate::bins::good_size(size) - size) as i64
+        };
+        let s = &mut self.bins[b];
+        s.allocs += 1;
+        s.live_bytes += size as i64;
+        s.peak_bytes = s.peak_bytes.max(s.live_bytes);
+        s.waste_bytes += waste;
+        self.allocs += 1;
+        self.live_bytes += size as i64;
+        self.peak_bytes = self.peak_bytes.max(self.live_bytes);
+        self.waste_bytes += waste;
+        if size > crate::types::LARGE_OBJ_SIZE_MAX {
+            self.huge_allocs += 1;
+            if size == self.last_huge_free {
+                self.huge_repeats += 1;
+            }
+        }
+    }
+
+    fn on_free(&mut self, size: usize) {
+        let b = crate::bins::bin(size);
+        let waste = if size > crate::types::MEDIUM_OBJ_SIZE_MAX {
+            0
+        } else {
+            (crate::bins::good_size(size) - size) as i64
+        };
+        let s = &mut self.bins[b];
+        s.frees += 1;
+        s.live_bytes -= size as i64;
+        s.waste_bytes -= waste;
+        self.frees += 1;
+        self.live_bytes -= size as i64;
+        self.waste_bytes -= waste;
+        if size > crate::types::LARGE_OBJ_SIZE_MAX {
+            self.huge_frees += 1;
+            self.last_huge_free = size;
+        }
+    }
+
+    fn on_realloc(&mut self, old: usize, new: usize) {
+        self.reallocs += 1;
+        if new > old {
+            self.realloc_grows += 1;
+            if new - old <= (old / 8).max(16) {
+                self.realloc_small_grows += 1;
+            }
+        } else if new < old {
+            self.realloc_shrinks += 1;
+        }
+        if old != new && old == self.last_new && new == self.last_old {
+            self.realloc_ping_pongs += 1;
+        }
+        self.last_old = old;
+        self.last_new = new;
+    }
+
+    fn merge(&mut self, o: &Self) {
+        for (a, b) in self.bins.iter_mut().zip(o.bins.iter()) {
+            a.allocs += b.allocs;
+            a.frees += b.frees;
+            a.live_bytes += b.live_bytes;
+            a.peak_bytes = a.peak_bytes.max(b.peak_bytes);
+            a.waste_bytes += b.waste_bytes;
+        }
+        self.allocs += o.allocs;
+        self.frees += o.frees;
+        self.live_bytes += o.live_bytes;
+        self.peak_bytes = self.peak_bytes.max(o.peak_bytes);
+        self.waste_bytes += o.waste_bytes;
+        self.reallocs += o.reallocs;
+        self.realloc_grows += o.realloc_grows;
+        self.realloc_shrinks += o.realloc_shrinks;
+        self.realloc_small_grows += o.realloc_small_grows;
+        self.realloc_ping_pongs += o.realloc_ping_pongs;
+        self.huge_allocs += o.huge_allocs;
+        self.huge_frees += o.huge_frees;
+        self.huge_repeats += o.huge_repeats;
+        self.arena_claims += o.arena_claims;
+        self.os_reserves += o.os_reserves;
+        self.chunk_parks += o.chunk_parks;
+        self.chunk_purges += o.chunk_purges;
+        self.threads += o.threads.max(1);
+    }
+}
+
+/// Update this thread's counters. Never nests: `f` only does arithmetic.
+fn count(d: &ThreadDebug, f: impl FnOnce(&mut DebugStats)) {
+    // SAFETY: owner thread; the only `&mut` to the counters, and `f` calls
+    // nothing that could reach here again.
+    f(unsafe { &mut *d.c.get() });
+}
+
+/// What happened to an arena chunk, counted from the segment paths.
+#[derive(Clone, Copy)]
+pub(crate) enum Chunk {
+    ArenaClaim,
+    OsReserve,
+    Park,
+    Purge,
+}
+
+/// Count a chunk event on the calling thread, if it has a heap (the chunk
+/// paths run under the heap; a thread without one is not counted).
+pub(crate) fn count_chunk(k: Chunk) {
+    let hb = crate::init::heap_box_fast();
+    if hb.is_null() || hb == crate::init::empty_heap_box_ptr() {
+        return;
+    }
+    // SAFETY: the calling thread's live heap box.
+    let d = unsafe { &(*hb).dbg };
+    count(d, |c| match k {
+        Chunk::ArenaClaim => c.arena_claims += 1,
+        Chunk::OsReserve => c.os_reserves += 1,
+        Chunk::Park => c.chunk_parks += 1,
+        Chunk::Purge => c.chunk_purges += 1,
+    });
+}
+
+/// Counters of exited threads, folded in by their teardown. Written and read
+/// only under the heap registry lock.
+struct Retired(core::cell::UnsafeCell<DebugStats>);
+
+// SAFETY: every access holds the heap registry lock (`init::debug_locked`).
+unsafe impl Sync for Retired {}
+
+static RETIRED: Retired = Retired(core::cell::UnsafeCell::new(DebugStats::new()));
+
+/// Fold a dying thread's counters into the retired total.
+///
+/// # Safety
+/// `hb` is the calling thread's live heap box.
+unsafe fn retire_counters(hb: *mut crate::init::HeapBox) {
+    crate::init::debug_locked(&mut |_| {
+        // SAFETY: registry lock held (RETIRED); `hb` is ours and live.
+        unsafe {
+            (*RETIRED.0.get()).merge(&*(*hb).dbg.c.get());
+            *(*hb).dbg.c.get() = DebugStats::new();
+        }
+    });
+}
+
+/// Process-wide counters: exited threads plus every live thread, merged now.
+/// Live threads are read without stopping them (like `stats::merged`), so a
+/// thread that is allocating at this moment may be a few counts off.
+#[allow(
+    clippy::volatile_composites,
+    reason = "racy diagnostic snapshot of a live thread's counters, as in init::for_each_heap"
+)]
+pub fn stats() -> DebugStats {
+    let mut t = DebugStats::new();
+    crate::init::debug_locked(&mut |head| {
+        // SAFETY: registry lock held: RETIRED is ours to read and every box
+        // on the list is live; the counter read is a racy snapshot.
+        unsafe {
+            t.merge(&*RETIRED.0.get());
+            t.threads = (*RETIRED.0.get()).threads;
+            let mut hb = head;
+            while !hb.is_null() {
+                let c = core::ptr::read_volatile((*hb).dbg.c.get());
+                if c.allocs + c.frees + c.arena_claims + c.os_reserves > 0 {
+                    t.merge(&c);
+                }
+                hb = (*hb).next_box.load(Ordering::Acquire);
+            }
+        }
+    });
+    for (i, b) in t.bins.iter_mut().enumerate() {
+        b.block_size = if i >= crate::types::BIN_HUGE {
+            0
+        } else {
+            crate::bins::bin_size(i)
+        };
+    }
+    t
+}
+
+/// Where memory goes, for the calling thread's heap and the process.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Fragmentation {
+    /// Process resident set now (0 where the OS does not say).
+    pub rss: usize,
+    /// Peak resident set.
+    pub peak_rss: usize,
+    /// Requested bytes live, process-wide (from [`stats`]).
+    pub live_bytes: i64,
+    /// Size-class rounding waste of those, process-wide.
+    pub waste_bytes: i64,
+    /// Pages of this thread's heap.
+    pub pages: usize,
+    /// Committed bytes of those pages.
+    pub page_bytes: usize,
+    /// Bytes in use in them (blocks in use times block size).
+    pub used_bytes: usize,
+    /// Pages less than a quarter used: held, mostly empty.
+    pub sparse_pages: usize,
+    /// Committed but unused bytes of those pages.
+    pub sparse_free_bytes: usize,
+    /// Bytes in this thread's quarantine.
+    pub quarantine_bytes: usize,
+    /// Freed arena chunks parked resident now (the resident budget).
+    pub parked_chunks: usize,
+}
+
+/// Fragmentation of the calling thread's heap, with process totals.
+pub fn fragmentation_report() -> Fragmentation {
+    let s = stats();
+    let (_, _, _, rss, peak_rss, _, _, _) = crate::stats::process_info();
+    let mut f = Fragmentation {
+        rss,
+        peak_rss,
+        live_bytes: s.live_bytes,
+        waste_bytes: s.waste_bytes,
+        parked_chunks: crate::arena::parked_resident().0,
+        ..Fragmentation::default()
+    };
+    let hb = crate::init::heap_box();
+    if hb.is_null() || hb == crate::init::empty_heap_box_ptr() {
+        return f;
+    }
+    let mut visit = |a: &crate::heap::AreaInfo, block: *mut u8, _: usize| -> bool {
+        if block.is_null() {
+            let used = a.used * a.block_size;
+            f.pages += 1;
+            f.page_bytes += a.committed;
+            f.used_bytes += used;
+            if used * 4 < a.committed {
+                f.sparse_pages += 1;
+                f.sparse_free_bytes += a.committed - used;
+            }
+        }
+        true
+    };
+    // SAFETY: the calling thread's own live heap; the visitor only counts.
+    unsafe {
+        (*(*hb).heap.get()).visit_blocks(false, &mut visit);
+        f.quarantine_bytes = (*hb).dbg.q_bytes.get();
+    }
+    f
+}
+
+fn line(args: fmt::Arguments<'_>) {
+    let mut b = Line::new();
+    let _ = fmt::write(&mut b, args);
+    crate::options::out_fmt(b.as_str());
+}
+
+/// Print [`stats`] and [`fragmentation_report`] to the output hook, in the
+/// spirit of `mi_stats_print`: totals, then one row per size class used.
+pub fn print_stats() {
+    let s = stats();
+    line(format_args!(
+        "rusty_alloc: stats: threads {} allocs {} frees {} live {} B peak {} B waste {} B\n",
+        s.threads, s.allocs, s.frees, s.live_bytes, s.peak_bytes, s.waste_bytes
+    ));
+    line(format_args!(
+        "rusty_alloc: realloc: {} (grow {} shrink {} small-grow {} ping-pong {})\n",
+        s.reallocs, s.realloc_grows, s.realloc_shrinks, s.realloc_small_grows, s.realloc_ping_pongs
+    ));
+    line(format_args!(
+        "rusty_alloc: huge: allocs {} frees {} same-size repeats {}; chunks: arena {} os {} parked {} purged {}\n",
+        s.huge_allocs,
+        s.huge_frees,
+        s.huge_repeats,
+        s.arena_claims,
+        s.os_reserves,
+        s.chunk_parks,
+        s.chunk_purges
+    ));
+    for b in s.bins.iter().filter(|b| b.allocs > 0) {
+        line(format_args!(
+            "rusty_alloc: bin {:>8}: allocs {} frees {} live {} B peak {} B waste {} B\n",
+            b.block_size, b.allocs, b.frees, b.live_bytes, b.peak_bytes, b.waste_bytes
+        ));
+    }
+    let f = fragmentation_report();
+    line(format_args!(
+        "rusty_alloc: memory: rss {} B (peak {}) live {} B; this thread: {} pages, {} B committed, {} B used, {} sparse pages holding {} B free, quarantine {} B; parked chunks {}\n",
+        f.rss,
+        f.peak_rss,
+        f.live_bytes,
+        f.pages,
+        f.page_bytes,
+        f.used_bytes,
+        f.sparse_pages,
+        f.sparse_free_bytes,
+        f.quarantine_bytes,
+        f.parked_chunks
+    ));
 }

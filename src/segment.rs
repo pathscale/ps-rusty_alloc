@@ -797,11 +797,29 @@ pub unsafe fn span_alloc(seg: *mut Segment, slices: usize) -> (*mut Page, bool) 
     // SAFETY: heap lock held; list and indices maintained by the invariants
     // in the module docs.
     unsafe {
-        // First fit over reclaimed spans (recycled memory — NOT zero).
+        // Best fit over reclaimed spans (recycled memory, NOT zero): the
+        // smallest free span that holds the request, an exact fit ends the
+        // walk. First fit on this LIFO list split whatever large hole was
+        // freed last for a one-slice page, so the next large request found
+        // no hole big enough and carved fresh slices off the bump frontier.
         let mut s = (*seg).free_spans;
+        let mut best: *mut Page = ptr::null_mut();
+        let mut best_len = usize::MAX;
         while !s.is_null() {
             let len = (*s).slice_count as usize;
-            if len >= slices {
+            if len >= slices && len < best_len {
+                best = s;
+                best_len = len;
+                if len == slices {
+                    break;
+                }
+            }
+            s = (*s).next;
+        }
+        if !best.is_null() {
+            let s = best;
+            let len = best_len;
+            {
                 let idx = page_index(seg, s);
                 // Re-commit BEFORE splitting so both halves are backed; the
                 // remainder inherits the (now cleared) purged state.
@@ -828,7 +846,6 @@ pub unsafe fn span_alloc(seg: *mut Segment, slices: usize) -> (*mut Page, bool) 
                 (*seg).used_pages += 1;
                 return (s, false);
             }
-            s = (*s).next;
         }
         // Bump (never-carved region — zero iff the mapping came fresh from
         // the OS; recycled arena chunks are dirty).

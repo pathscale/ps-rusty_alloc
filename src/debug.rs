@@ -1049,6 +1049,7 @@ pub fn quarantine_limit() -> usize {
     if l != usize::MAX {
         return l;
     }
+    #[allow(unused_mut, reason = "only targets with an environment change it")]
     let mut l = QUARANTINE_DEFAULT;
     #[cfg(all(any(windows, unix), not(miri)))]
     {

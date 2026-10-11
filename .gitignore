@@ -2,3 +2,4 @@
 Cargo.lock
 /bench/target
 /bench/bin
+/bench/nostd-mt/target

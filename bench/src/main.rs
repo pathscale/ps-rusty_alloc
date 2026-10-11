@@ -184,6 +184,11 @@ fn realistic(iters: u64, seed: u64) -> u64 {
             s.push_str("-suffix-that-forces-a-realloc");
         }
         chk = chk.wrapping_add(m.len() as u64 + names.iter().map(|s| s.len() as u64).sum::<u64>());
+        if it + 1 == iters {
+            seg_probe("realistic:last");
+        } else if std::env::var_os("BENCH_SEG_PROBE_HW").is_some() {
+            seg_hw(it);
+        }
         drop(m);
         drop(names);
     }
@@ -285,6 +290,77 @@ fn phases(seed: u64) -> u64 {
     }
     chk.wrapping_add(keep.len() as u64)
 }
+
+/// BENCH_SEG_PROBE: dump every heap's segment span layout to stderr
+/// (high-water slice, free spans, live spans by kind). rusty_alloc only.
+#[cfg(feature = "rusty_alloc")]
+fn seg_probe(tag: &str) {
+    if std::env::var_os("BENCH_SEG_PROBE").is_none() {
+        return;
+    }
+    let mut out = String::new();
+    rusty_alloc::init::for_each_heap(&mut |h| unsafe {
+        let mut seg = h.segments;
+        while !seg.is_null() {
+            let hw = (*seg).next_free_slice as usize;
+            let (mut free_sl, mut free_n, mut big_free) = (0usize, 0usize, 0usize);
+            let (mut small, mut medium, mut large, mut large_sl) = (0usize, 0usize, 0usize, 0usize);
+            let mut layout = String::new();
+            let mut i = 1usize;
+            while i < hw {
+                let pg = &(*seg).pages[i];
+                let n = pg.slice_count as usize;
+                if pg.block_size == 0 {
+                    free_sl += n;
+                    free_n += 1;
+                    big_free = big_free.max(n);
+                    layout.push_str(&format!(" F{n}"));
+                } else if pg.reserved == 1 && pg.capacity == 1 {
+                    large += 1;
+                    large_sl += n;
+                    layout.push_str(&format!(" L{n}"));
+                } else if n == 1 {
+                    small += 1;
+                    layout.push_str(&format!(" s{}/{}", pg.used, pg.reserved));
+                } else {
+                    medium += 1;
+                    layout.push_str(&format!(" m{n}:{}/{}", pg.used, pg.reserved));
+                }
+                i += n.max(1);
+            }
+            out.push_str(&format!(
+                "{tag} seg hw={hw} used_pages={} free_slices={free_sl} free_spans={free_n} max_free={big_free} small={small} medium={medium} large={large}/{large_sl}sl\n  layout:{layout}\n",
+                (*seg).used_pages
+            ));
+            seg = (*seg).next;
+        }
+    });
+    let s = rusty_alloc::stats::merged();
+    out.push_str(&format!(
+        "{tag} stats pages_fresh={} retired={} segments={} freed={} large={} extends={}\n",
+        s.pages_fresh, s.pages_retired, s.segments, s.segments_freed, s.large_allocs, s.extends
+    ));
+    eprint!("{out}");
+}
+#[cfg(not(feature = "rusty_alloc"))]
+fn seg_probe(_tag: &str) {}
+#[cfg(feature = "rusty_alloc")]
+fn seg_hw(it: u64) {
+    rusty_alloc::init::for_each_heap(&mut |h| unsafe {
+        let mut seg = h.segments;
+        while !seg.is_null() {
+            eprintln!(
+                "it={it} hw={} used={} rss={:.2}",
+                (*seg).next_free_slice,
+                (*seg).used_pages,
+                maxrss_mb()
+            );
+            seg = (*seg).next;
+        }
+    });
+}
+#[cfg(not(feature = "rusty_alloc"))]
+fn seg_hw(_it: u64) {}
 
 /// Peak RSS so far (getrusage; bytes on macOS).
 fn maxrss_mb() -> f64 {
@@ -397,6 +473,7 @@ fn main() {
         }
     };
     let ns = start.elapsed().as_nanos() as f64;
+    seg_probe("end");
     println!(
         "alloc={} wl={} t={} ms={:.2} ns_op={:.2} chk={}",
         NAME,

@@ -34,11 +34,14 @@ Changes in this fork:
   #[global_allocator]
   static GLOBAL: rusty_alloc::RustyAlloc = rusty_alloc::RustyAlloc;
   ```
-- Debug mode on `RustyAlloc` behind upstream's `debug_checks` feature: header
-  checksums and canaries catch foreign and raw-API frees (FFI mismatches),
-  interior pointers, double frees, layout mismatches and overflows; freed
-  blocks are poisoned in a 1 MiB per-thread quarantine to catch writes after
-  free; `debug::leak_report`, `debug::stats` (per size class, realloc
+- Debug mode on `RustyAlloc` and the raw API behind upstream's `debug_checks`
+  feature: header checksums and canaries catch foreign and raw-API frees (FFI
+  mismatches), interior pointers, double frees, layout mismatches and
+  overflows; freed blocks are poisoned in a 1 MiB per-thread quarantine to
+  catch writes after free; reports carry the call sites where the block was
+  allocated and freed and where the misuse was found (frame-pointer stacks,
+  symbolized offline by `tools/symbolize.ts`); `debug::leak_report` over
+  every thread's live blocks, `debug::stats` (per size class, realloc
   patterns, huge and chunk churn) and `debug::fragmentation_report`. Aborts
   with a report by default; `debug::set_handler` changes that. The
   performance build's machine code is unchanged. See

@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Debug mode (`debug_checks`) records call sites. Every allocation and free
+  captures its stack with a frame-pointer walk (aarch64 and x86-64 on macOS,
+  iOS, Linux and Android) that allocates nothing and needs no `std`, into a
+  stack depot on OS pages, as ASan's `StackDepot`. Reports show where a
+  misuse was found and, for a known block, where it was freed and allocated;
+  leak reports group blocks by allocation stack. Build the program with
+  `-C force-frame-pointers=yes` for full stacks. Frames print as
+  image+offset; `bun tools/symbolize.ts report.txt` names them (atos on
+  macOS, addr2line on Linux). New API: `debug::capture`,
+  `debug::thread_number`, the `debug::stack` module, thread and stack
+  fields on `Violation` and `Leak`, `LeakSummary::unlisted`, and
+  `RUSTY_ALLOC_DEBUG_STACK_DEPTH` (default 16, 0 turns capture off).
+- Debug mode leak reports cover every thread, running or exited: live
+  blocks are kept on a registry of address-sharded lists threaded through
+  their headers (as Windows PageHeap's busy list), so `leak_report` reads
+  only live, mapped headers and never stops another thread.
+- Debug mode checks the raw API: `rusty_alloc::alloc::*` allocations, frees,
+  reallocs and `usable_size` (aligned, zeroing and heap variants included)
+  get the same header, canary, quarantine, call sites and checks as
+  `RustyAlloc`. A `RustyAlloc` dealloc of a raw block is
+  `NotFromGlobalAlloc`; a raw free of a `RustyAlloc` block is allowed, as
+  in Scudo.
+
+### Changed
+
+- Debug mode: the block header is 64 bytes (was 32), and a debug build costs
+  about twice the instructions it did (8x the performance build on
+  `tasks:1`, 3.7x before); `RUSTY_ALLOC_DEBUG_STACK_DEPTH=0` takes most of
+  that back. The performance build is byte-identical to 2.3.2's.
+
 ## 2.3.2 - 2026-10-11
 
 ### Added

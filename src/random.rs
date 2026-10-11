@@ -204,6 +204,21 @@ fn os_entropy(key: &mut [u32; 8]) -> bool {
     f.read_exact(buf).is_ok()
 }
 
+/// Without `std` on unix: `getentropy`, which macOS (10.12+), glibc (2.25+)
+/// and musl all provide, needs no file descriptor and fills up to 256 bytes
+/// in one call. It is one of the calls upstream's `_mi_prim_random_buf`
+/// makes.
+#[cfg(all(unix, not(feature = "std"), not(miri)))]
+fn os_entropy(key: &mut [u32; 8]) -> bool {
+    // Declared here rather than taken from `libc`, which does not carry it for
+    // every unix target (musl has had it since 1.1.20; the crate omits it).
+    unsafe extern "C" {
+        fn getentropy(buf: *mut core::ffi::c_void, len: usize) -> core::ffi::c_int;
+    }
+    // SAFETY: writes exactly `size_of_val(key)` (32) bytes into our own array.
+    unsafe { getentropy(key.as_mut_ptr().cast(), core::mem::size_of_val(key)) == 0 }
+}
+
 #[cfg(miri)]
 fn os_entropy(_key: &mut [u32; 8]) -> bool {
     false // deterministic fallback under the interpreter
@@ -227,9 +242,8 @@ fn os_entropy(_key: &mut [u32; 8]) -> bool {
     not(miri),
     not(windows),
     not(target_arch = "wasm32"),
-    // Bare metal, AND unix-without-`std`: both reach here because neither can
-    // open `/dev/urandom`.
-    not(all(unix, feature = "std"))
+    // Bare metal only: unix without `std` has `getentropy` above.
+    not(unix)
 ))]
 fn os_entropy(_key: &mut [u32; 8]) -> bool {
     false

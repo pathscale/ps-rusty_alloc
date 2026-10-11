@@ -1,16 +1,22 @@
 //! Proves each debug-mode check of `rusty_alloc` (`debug_checks` feature) by
 //! triggering it. Prints one `key: value` line per finding to stdout; the
 //! output is compared byte for byte with `fixtures/debug_demo.expected` by
-//! `bun fixtures.ts`. Addresses never appear in the output.
+//! `bun fixtures.ts`. Addresses never appear in the output: a call stack is
+//! printed as `{image+offset@address;...}`, which fixtures.ts symbolizes and
+//! reduces to the first function outside the allocator and the runtime.
 //!
 //! Usage: debug_demo            all cases, log-and-continue handler
 //!        debug_demo abort      one double free under the default handler
 
 use rusty_alloc::RustyAlloc;
+use rusty_alloc::alloc as raw;
+use rusty_alloc::debug::stack::{self, StackId};
 use rusty_alloc::debug::{self, Violation};
 use std::alloc::{GlobalAlloc, Layout};
 use std::cell::Cell;
+use std::hint::black_box;
 use std::io::Write;
+use std::sync::{Arc, Barrier, mpsc};
 
 #[global_allocator]
 static A: RustyAlloc = RustyAlloc;
@@ -66,14 +72,142 @@ fn case(out: &mut Vec<String>, key: &str, f: impl FnOnce()) {
     out.push(format!("{key}: {}", take()));
 }
 
+/// A stack as `{image+offset@address;...}` (`{}` when none was captured).
+fn frames(id: StackId) -> String {
+    let parts: Vec<String> = stack::frames(id)
+        .iter()
+        .map(|&a| match stack::image_of(a) {
+            Some((name, base)) => format!("{name}+{:#x}@{a:#x}", a - base),
+            None => format!("?@{a:#x}"),
+        })
+        .collect();
+    format!("{{{}}}", parts.join(";"))
+}
+
+/// A case whose report must name its call sites: where the block was
+/// allocated, where it was freed, and where the misuse was found, all on
+/// this thread.
+fn sites(out: &mut Vec<String>, key: &str, f: impl FnOnce()) {
+    f();
+    let me = debug::thread_number();
+    let line = match LAST.with(Cell::take) {
+        None => "none".into(),
+        Some(v) => format!(
+            "{} alloc={} free={} found={} same_thread={}",
+            v.kind.name(),
+            frames(v.alloc_stack),
+            frames(v.free_stack),
+            frames(v.stack),
+            v.thread == me
+                && v.alloc_thread == me
+                && (v.free_stack.is_none() || v.free_thread == me)
+        ),
+    };
+    out.push(format!("{key}: {line}"));
+}
+
+// Call sites. Each is a function of its own (never inlined, never a tail
+// call, never identical to another) so it shows up as one frame by name.
+
+#[inline(never)]
+fn site_alloc(l: Layout) -> *mut u8 {
+    // SAFETY (demo): a valid layout.
+    black_box(unsafe { A.alloc(l) })
+}
+
+#[inline(never)]
+fn site_free(p: *mut u8, l: Layout) {
+    // SAFETY (demo): misuse here is deliberate and caught.
+    unsafe { A.dealloc(black_box(p), l) };
+    black_box(0x11u32);
+}
+
+#[inline(never)]
+fn site_free_again(p: *mut u8, l: Layout) {
+    // SAFETY (demo): misuse here is deliberate and caught.
+    unsafe { A.dealloc(black_box(p), l) };
+    black_box(0x22u32);
+}
+
+#[inline(never)]
+fn site_flush() {
+    debug::flush_quarantine();
+    black_box(0x33u32);
+}
+
+#[inline(never)]
+fn raw_site_alloc(n: usize) -> *mut u8 {
+    black_box(raw::malloc(n))
+}
+
+#[inline(never)]
+fn raw_site_free(p: *mut u8) {
+    // SAFETY (demo): misuse here is deliberate and caught.
+    unsafe { raw::free(black_box(p)) };
+    black_box(0x44u32);
+}
+
+#[inline(never)]
+fn raw_site_free_again(p: *mut u8) {
+    // SAFETY (demo): misuse here is deliberate and caught.
+    unsafe { raw::free(black_box(p)) };
+    black_box(0x55u32);
+}
+
+#[inline(never)]
+fn leak_in_thread(n: usize) -> *mut u8 {
+    black_box(0x77u32);
+    // SAFETY (demo): a valid layout.
+    black_box(unsafe { A.alloc(lay(n, 8)) })
+}
+
+#[inline(never)]
+fn leak_in_worker(n: usize) -> *mut u8 {
+    black_box(0x66u32);
+    // SAFETY (demo): a valid layout.
+    black_box(unsafe { A.alloc(lay(n, 8)) })
+}
+
+/// The default handler report with each run of frame lines folded into one
+/// `{...}` stack and every other address scrubbed.
+fn fold_frames(s: &str) -> String {
+    let mut out = String::new();
+    let mut run: Vec<String> = Vec::new();
+    let flush = |out: &mut String, run: &mut Vec<String>| {
+        if !run.is_empty() {
+            out.push_str(&format!("rusty_alloc:     {{{}}}\n", run.join(";")));
+            run.clear();
+        }
+    };
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("rusty_alloc:     #") {
+            // "N 0xADDR (image+0xOFF)" or "N 0xADDR".
+            let mut it = rest.split(' ');
+            let _n = it.next();
+            let addr = it.next().unwrap_or("?");
+            let img = it.collect::<Vec<_>>().join(" ");
+            let img = img.trim_start_matches('(').trim_end_matches(')');
+            run.push(if img.is_empty() {
+                format!("?@{addr}")
+            } else {
+                format!("{img}@{addr}")
+            });
+            continue;
+        }
+        flush(&mut out, &mut run);
+        out.push_str(&scrub(line));
+        out.push('\n');
+    }
+    flush(&mut out, &mut run);
+    out
+}
+
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("abort") {
-        // SAFETY (demo): a deliberate double free, caught before the core.
-        unsafe {
-            let p = A.alloc(lay(40, 8));
-            A.dealloc(p, lay(40, 8));
-            A.dealloc(p, lay(40, 8));
-        }
+        // A deliberate double free, caught before the core.
+        let p = site_alloc(lay(40, 8));
+        site_free(p, lay(40, 8));
+        site_free_again(p, lay(40, 8));
         println!("not reached");
         return;
     }
@@ -168,6 +302,92 @@ fn main() {
             p.write(7);
             A.dealloc(q, lay(64, 8));
             debug::flush_quarantine();
+        });
+
+        // Call sites in violation reports.
+        sites(&mut out, "sites_double_free", || {
+            let p = site_alloc(lay(40, 8));
+            site_free(p, lay(40, 8));
+            site_free_again(p, lay(40, 8));
+        });
+        sites(&mut out, "sites_use_after_free", || {
+            let p = site_alloc(lay(48, 8));
+            site_free(p, lay(48, 8));
+            p.add(8).write(1);
+            site_flush();
+        });
+        sites(&mut out, "sites_buffer_overflow", || {
+            let p = site_alloc(lay(24, 8));
+            p.add(24).write(0x41);
+            site_free(p, lay(24, 8));
+        });
+
+        // The raw API (rusty_alloc::alloc) gets the same checks.
+        case(&mut out, "raw_clean", || {
+            let p = raw::malloc(32);
+            let q = raw::zalloc(32);
+            let r = raw::malloc_aligned(100, 64);
+            let ok = std::slice::from_raw_parts(p, 32)
+                .iter()
+                .all(|&b| b == debug::UNINIT_BYTE)
+                && std::slice::from_raw_parts(q, 32).iter().all(|&b| b == 0)
+                && r.addr().is_multiple_of(64);
+            assert!(ok, "raw fills or alignment");
+            let s = raw::realloc(p, 64);
+            raw::free(s);
+            raw::free(q);
+            raw::free(r);
+        });
+        out.push(format!("raw_usable_size: {}", {
+            let p = raw::malloc(13);
+            let n = raw::usable_size(p);
+            raw::free(p);
+            n
+        }));
+        case(&mut out, "raw_double_free", || {
+            let p = raw::malloc(40);
+            raw::free(p);
+            raw::free(p);
+        });
+        case(&mut out, "raw_foreign_pointer", || {
+            let p = libc::malloc(32).cast::<u8>();
+            raw::free(p);
+            libc::free(p.cast());
+        });
+        case(&mut out, "raw_interior_pointer", || {
+            let p = raw::malloc(64);
+            raw::free(p.add(16));
+            raw::free(p);
+        });
+        case(&mut out, "raw_buffer_overflow", || {
+            let p = raw::malloc(24);
+            p.add(24).write(0x41);
+            raw::free(p);
+        });
+        case(&mut out, "raw_use_after_free", || {
+            let p = raw::malloc(48);
+            raw::free(p);
+            p.add(8).write(1);
+            debug::flush_quarantine();
+        });
+        case(&mut out, "raw_realloc_stale_write", || {
+            let p = raw::malloc(16);
+            let q = raw::realloc(p, 64);
+            p.write(7);
+            raw::free(q);
+            debug::flush_quarantine();
+        });
+        // Allowed both ways round would hide a real mixup, so only one way
+        // is: a raw free of a GlobalAlloc block is fine (as in Scudo), a
+        // GlobalAlloc dealloc of a raw block is not_from_global_alloc (above).
+        case(&mut out, "raw_free_of_global_alloc", || {
+            let p = A.alloc(lay(32, 8));
+            raw::free(p);
+        });
+        sites(&mut out, "sites_raw_double_free", || {
+            let p = raw_site_alloc(40);
+            raw_site_free(p);
+            raw_site_free_again(p);
         });
     }
 
@@ -286,6 +506,82 @@ fn main() {
         unsafe { A.dealloc(*p, lay(s, 8)) };
     }
 
+    // A leak on a spawned thread that is still running, with its call site.
+    let me = debug::thread_number();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let t = std::thread::spawn(move || {
+        let p = leak_in_thread(321);
+        ready_tx.send((p.addr(), debug::thread_number())).unwrap();
+        go_rx.recv().unwrap();
+        // SAFETY (demo): allocated above with this layout.
+        unsafe { A.dealloc(p, lay(321, 8)) };
+    });
+    let (addr, tno) = ready_rx.recv().unwrap();
+    // The visitor must not allocate: keep the stack id, format it after.
+    let mut seen = None;
+    debug::leak_report(&mut |l| {
+        if l.ptr == addr {
+            seen = Some((l.size, l.thread, l.stack));
+        }
+    });
+    out.push(format!(
+        "leak_live_thread: {}",
+        seen.map_or("not found".into(), |(size, thread, site)| format!(
+            "size={size} other_thread={} site={site}",
+            thread == tno && thread != me,
+            site = frames(site)
+        ))
+    ));
+    go_tx.send(()).unwrap();
+    t.join().unwrap();
+
+    // Leaks on several live threads at once.
+    let sizes = [1111usize, 2222, 3333];
+    let gate = Arc::new(Barrier::new(sizes.len() + 1));
+    let workers: Vec<_> = sizes
+        .iter()
+        .map(|&n| {
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || {
+                let p = leak_in_worker(n);
+                gate.wait(); // allocated
+                gate.wait(); // reported
+                // SAFETY (demo): allocated above with this layout.
+                unsafe { A.dealloc(p, lay(n, 8)) };
+            })
+        })
+        .collect();
+    gate.wait();
+    let mut hits = [(0usize, 0u32, StackId::NONE); 8];
+    let mut n = 0;
+    debug::leak_report(&mut |l| {
+        if sizes.contains(&l.size) && l.thread != me && n < hits.len() {
+            hits[n] = (l.size, l.thread, l.stack);
+            n += 1;
+        }
+    });
+    gate.wait();
+    for w in workers {
+        w.join().unwrap();
+    }
+    let mut found: Vec<(usize, u32, String)> =
+        hits[..n].iter().map(|h| (h.0, h.1, frames(h.2))).collect();
+    found.sort();
+    let mut threads: Vec<u32> = found.iter().map(|f| f.1).collect();
+    threads.sort_unstable();
+    threads.dedup();
+    out.push(format!(
+        "leaks_live_threads: sizes={:?} threads={} sites={}",
+        found.iter().map(|f| f.0).collect::<Vec<_>>(),
+        threads.len(),
+        found
+            .iter()
+            .map(|f| f.2.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    ));
+
     // At exit with show_stats on: the report is printed.
     let child = std::process::Command::new(std::env::current_exe().unwrap())
         .arg("atexit")
@@ -334,7 +630,7 @@ fn main() {
     ));
     out.push(format!(
         "default_handler_stderr: {:?}",
-        scrub(&String::from_utf8_lossy(&child.stderr))
+        fold_frames(&String::from_utf8_lossy(&child.stderr))
     ));
     {
         use std::os::unix::process::ExitStatusExt;

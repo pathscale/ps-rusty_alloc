@@ -63,6 +63,81 @@ pub struct Arena {
     pub numa_node: i32,
     used: [AtomicBitWord; MAX_CHUNKS / WORD_BITS],
     dirty: [AtomicBitWord; MAX_CHUNKS / WORD_BITS],
+    /// ps: free chunks that went back with their tenant's pages still
+    /// resident, each counted once in [`PARKED_RESIDENT`]. Set only by
+    /// [`chunk_free_state`], cleared only by whoever claims the chunk next
+    /// (see `settle_claimed`), so the count is exact whichever path claims.
+    parked: [AtomicBitWord; MAX_CHUNKS / WORD_BITS],
+    /// ps: free chunks whose carved range was decommitted on the way back and
+    /// must be committed again before the next tenant writes to it.
+    decommitted: [AtomicBitWord; MAX_CHUNKS / WORD_BITS],
+}
+
+/// ps: how a chunk is returned by [`chunk_free_state`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ChunkState {
+    /// Nothing for the next claimer to settle.
+    Plain,
+    /// Pages still resident; already counted in [`PARKED_RESIDENT`].
+    Parked,
+    /// Carved range decommitted; the next claimer recommits it.
+    Decommitted,
+}
+
+/// ps: free chunks currently parked resident, process-wide. Incremented by
+/// the segment free path before it parks a chunk, decremented exactly once
+/// by the claim that takes the chunk, whether that claim is a Normal
+/// segment, a huge block spanning it, or anything else that allocates
+/// chunks. The state lives in the arena's own bitmaps, not in the chunk, so
+/// a huge block that overwrites the chunk's first bytes cannot fake it.
+pub(crate) static PARKED_RESIDENT: AtomicUsize = AtomicUsize::new(0);
+
+/// ps probe: (`PARKED_RESIDENT`, chunks whose parked bit is set). The two are
+/// equal whenever no free or claim is in flight.
+pub fn parked_resident() -> (usize, usize) {
+    let mut bits = 0usize;
+    let n = ARENA_COUNT.load(Ordering::Acquire).min(MAX_ARENAS);
+    for slot in ARENAS.iter().take(n) {
+        let a = slot.load(Ordering::Acquire);
+        if a.is_null() {
+            continue;
+        }
+        // SAFETY: arena descriptors are live for the process.
+        unsafe {
+            for w in &(*a).parked {
+                bits += w.load(Ordering::Relaxed).count_ones() as usize;
+            }
+        }
+    }
+    (PARKED_RESIDENT.load(Ordering::Relaxed), bits)
+}
+
+/// ps: settle what the previous tenants of chunks `start..start + n` left,
+/// right after this caller claimed them: uncount parked chunks and recommit
+/// decommitted ones. Every claim path calls this, so no claimer can take a
+/// parked chunk without uncounting it.
+///
+/// # Safety
+/// `a` is a live descriptor and the caller has just set the `used` bits of
+/// `start..start + n`.
+unsafe fn settle_claimed(a: *mut Arena, start: usize, n: usize) {
+    // SAFETY: per contract; bit indices lie inside the live chunks.
+    unsafe {
+        for j in start..start + n {
+            let (w, m) = (j / WORD_BITS, (1 as BitWord) << (j % WORD_BITS));
+            if (*a).parked[w].load(Ordering::Acquire) & m != 0
+                && (*a).parked[w].fetch_and(!m, Ordering::AcqRel) & m != 0
+            {
+                PARKED_RESIDENT.fetch_sub(1, Ordering::Relaxed);
+            }
+            if (*a).decommitted[w].load(Ordering::Acquire) & m != 0
+                && (*a).decommitted[w].fetch_and(!m, Ordering::AcqRel) & m != 0
+                && os::commit((*a).base.add(j * SEGMENT_SIZE), SEGMENT_SIZE).is_err()
+            {
+                crate::stats::commit_failed();
+            }
+        }
+    }
 }
 
 static ARENAS: [AtomicPtr<Arena>; MAX_ARENAS] =
@@ -366,6 +441,7 @@ fn chunk_alloc_inner(restrict_id: i32) -> Option<(*mut u8, bool)> {
                         continue;
                     }
                     let idx = w * WORD_BITS + bit;
+                    settle_claimed(a, idx, 1);
                     let was_dirty =
                         (*a).dirty[w].fetch_or(1 << bit, Ordering::AcqRel) & (1 << bit) != 0;
                     let p = (*a).base.add(idx * SEGMENT_SIZE);
@@ -480,6 +556,7 @@ fn chunk_alloc_n_inner(restrict_id: i32, n: usize) -> Option<(*mut u8, bool)> {
                                 cur_w = usize::MAX; // reload the live word
                                 continue;
                             }
+                            settle_claimed(a, start, n);
                             let dirty_prev = (*a).dirty[w].fetch_or(mask, Ordering::AcqRel);
                             let p = (*a).base.add(start * SEGMENT_SIZE);
                             return Some((p, dirty_prev & mask == 0));
@@ -511,6 +588,7 @@ fn chunk_alloc_n_inner(restrict_id: i32, n: usize) -> Option<(*mut u8, bool)> {
                             cur_w = usize::MAX; // reload the live word
                             continue;
                         }
+                        settle_claimed(a, start, n);
                         let mut any_dirty = false;
                         for j in start..=idx {
                             any_dirty |= (*a).dirty[j / WORD_BITS]
@@ -608,6 +686,35 @@ pub fn owns(p: *const u8) -> bool {
 /// Return a chunk to its arena. True when the address belonged to one.
 pub fn chunk_free(p: *mut u8) -> bool {
     chunk_free_n(p, 1)
+}
+
+/// ps: return one chunk to its arena with a state for its next claimer
+/// (see [`ChunkState`]). The state bit is published BEFORE the `used` bit is
+/// released, so the claim that observes the chunk free observes its state.
+/// False when `p` is not an arena chunk; the state is then not recorded.
+pub(crate) fn chunk_free_state(p: *mut u8, state: ChunkState) -> bool {
+    if state == ChunkState::Plain {
+        return chunk_free(p);
+    }
+    let Some((a, off, chunks)) = find_arena(p.addr()) else {
+        return false;
+    };
+    if !off.is_multiple_of(SEGMENT_SIZE) || off / SEGMENT_SIZE >= chunks {
+        return false;
+    }
+    let j = off / SEGMENT_SIZE;
+    let (w, m) = (j / WORD_BITS, (1 as BitWord) << (j % WORD_BITS));
+    // SAFETY: live descriptor; `j` lies inside its live chunks.
+    unsafe {
+        let bits = if state == ChunkState::Parked {
+            &(*a).parked
+        } else {
+            &(*a).decommitted
+        };
+        bits[w].fetch_or(m, Ordering::Release);
+        (*a).used[w].fetch_and(!m, Ordering::AcqRel);
+    }
+    true
 }
 
 /// Adopt an OS block that cannot be returned to the host, making its memory

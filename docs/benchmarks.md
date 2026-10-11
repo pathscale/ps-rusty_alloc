@@ -30,6 +30,7 @@ Workloads (`bench/src/main.rs`, `name:threads`):
 | phases | 8 phases of 64 MB of one size class, 90% freed at random, 10% survive |
 | workers | 8 waves of t threads, each builds about 24 MB of maps and strings, drops, exits |
 | large | 4 KB-1 MB, 32 live per thread, every page touched |
+| hugepark | 6 rounds: t threads build about 4 MB and exit, then three 80 MB huge blocks claim the freed chunks (a probe for the resident budget, see resident-budget.md) |
 
 ## Verdict
 

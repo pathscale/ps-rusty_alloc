@@ -834,8 +834,10 @@ pub fn register_deferred_free(f: Option<DeferredFreeFun>, arg: *mut c_void) {
 ///
 /// Takes `&str` and needs no allocation, so this SEAM survives `no_std` — a
 /// firmware that registers an output hook still gets the allocator's messages
-/// over its serial log. Only the *stderr fallback* and the `format!`-based
-/// CALLERS are std-only (P3 of `docs/plans/small-metal.md`, §2.5).
+/// over its serial log. The *stderr fallback* is `std::io` with `std`, a raw
+/// `write(2)` on unix without it, and absent on a target with no OS; the
+/// `format!`-based CALLERS are std-only (P3 of `docs/plans/small-metal.md`,
+/// §2.5).
 pub fn out_fmt(msg: &str) {
     let (f, a) = OUTPUT_FUN.load();
     if f.is_null() {
@@ -847,6 +849,14 @@ pub fn out_fmt(msg: &str) {
         {
             use std::io::Write;
             let _ = std::io::stderr().write_all(msg.as_bytes());
+        }
+        // Without `std` on unix: the raw `write(2)` upstream's
+        // `_mi_prim_out_stderr` makes. A short write is not retried; this is
+        // a diagnostic, and looping on a broken stderr helps nobody.
+        #[cfg(all(unix, not(feature = "std")))]
+        // SAFETY: writes `msg.len()` bytes from a live `&str` to fd 2.
+        unsafe {
+            let _ = libc::write(2, msg.as_ptr().cast(), msg.len());
         }
         return;
     }

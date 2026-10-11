@@ -829,7 +829,7 @@ pub fn print_leaks(max: usize) -> LeakSummary {
 // At exit
 // ---------------------------------------------------------------------------
 
-#[cfg(all(unix, feature = "std", not(miri)))]
+#[cfg(all(unix, not(miri)))]
 static AT_EXIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// With `show_stats` on (`RUSTY_ALLOC_SHOW_STATS=1` or
@@ -837,7 +837,7 @@ static AT_EXIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool:
 /// mimalloc does. Registered on the first debug allocation.
 #[inline]
 fn at_exit_register() {
-    #[cfg(all(unix, feature = "std", not(miri)))]
+    #[cfg(all(unix, not(miri)))]
     if !AT_EXIT.load(Ordering::Relaxed) && !AT_EXIT.swap(true, Ordering::Relaxed) {
         extern "C" fn at_exit() {
             if crate::options::is_enabled(1) {

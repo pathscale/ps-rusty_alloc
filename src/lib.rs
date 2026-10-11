@@ -28,10 +28,16 @@
 /// unwinding out of `free` into a C caller is not an option (which is why the
 /// release profile is `panic = "abort"`).
 ///
-/// Without `std` there is no `process::abort`, so this panics and relies on the
-/// deliverable's panic strategy. **A `no_std` consumer MUST build with
-/// `panic = "abort"`** — every Janus firmware profile already does — or an
-/// abort becomes an unwind and the guarantee is gone.
+/// Without `std` on unix this is `libc::abort`, the same call upstream's
+/// `_mi_error_message` path ends in: it raises `SIGABRT` and never unwinds,
+/// so a `no_std` consumer built with `panic = "unwind"` gets the same
+/// guarantee as one built with `panic = "abort"`.
+///
+/// On a target with no OS (`prim::fixed`, wasm without `std`) there is no
+/// abort to call, so this panics and relies on the deliverable's panic
+/// strategy. **Such a consumer MUST build with `panic = "abort"`**, as every
+/// firmware profile already does, or an abort becomes an unwind and the
+/// guarantee is gone.
 #[cold]
 #[inline(never)]
 pub(crate) fn abort() -> ! {
@@ -39,7 +45,12 @@ pub(crate) fn abort() -> ! {
     {
         std::process::abort()
     }
-    #[cfg(not(feature = "std"))]
+    #[cfg(all(not(feature = "std"), unix))]
+    // SAFETY: `abort` has no preconditions and does not return.
+    unsafe {
+        libc::abort()
+    }
+    #[cfg(all(not(feature = "std"), not(unix)))]
     {
         panic!("rusty_alloc: abort (build a no_std consumer with panic = \"abort\")")
     }

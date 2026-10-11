@@ -482,7 +482,7 @@ pub fn segment_alloc(arena_id: i32) -> Result<*mut Segment, PrimError> {
 /// this many freed chunks stay resident (cheap, warm reuse); a free beyond it
 /// purges the touched range of that chunk on the spot. The same shape as a
 /// retire queue that sweeps only once its backlog passes a trigger.
-const RESIDENT_FREE_BUDGET: usize = 2;
+const RESIDENT_FREE_BUDGET: usize = 8;
 const FREE_STATE_NONE: u8 = 0;
 const FREE_STATE_RESIDENT: u8 = 1;
 const FREE_STATE_PURGED_RECOMMIT: u8 = 2;

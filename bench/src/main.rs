@@ -306,10 +306,23 @@ fn seg_probe(tag: &str) {
             let (mut free_sl, mut free_n, mut big_free) = (0usize, 0usize, 0usize);
             let (mut small, mut medium, mut large, mut large_sl) = (0usize, 0usize, 0usize, 0usize);
             let mut layout = String::new();
+            let mut res_by = [0usize; 4]; // resident KiB: free, large, small, medium
             let mut i = 1usize;
             while i < hw {
                 let pg = &(*seg).pages[i];
                 let n = pg.slice_count as usize;
+                let kib = resident_kib(seg.cast::<u8>().add(i * 65536), n.max(1) * 65536);
+                let kind = if pg.block_size == 0 {
+                    0
+                } else if pg.reserved == 1 && pg.capacity == 1 {
+                    1
+                } else if n == 1 {
+                    2
+                } else {
+                    3
+                };
+                res_by[kind] += kib;
+                layout.push_str(&format!(" {kib}k"));
                 if pg.block_size == 0 {
                     free_sl += n;
                     free_n += 1;
@@ -329,8 +342,8 @@ fn seg_probe(tag: &str) {
                 i += n.max(1);
             }
             out.push_str(&format!(
-                "{tag} seg hw={hw} used_pages={} free_slices={free_sl} free_spans={free_n} max_free={big_free} small={small} medium={medium} large={large}/{large_sl}sl\n  layout:{layout}\n",
-                (*seg).used_pages
+                "{tag} seg resident_kib free={} large={} small={} medium={} hw={hw} used_pages={} free_slices={free_sl} free_spans={free_n} max_free={big_free} small={small} medium={medium} large={large}/{large_sl}sl\n  layout:{layout}\n",
+                res_by[0], res_by[1], res_by[2], res_by[3], (*seg).used_pages
             ));
             seg = (*seg).next;
         }
@@ -344,6 +357,18 @@ fn seg_probe(tag: &str) {
 }
 #[cfg(not(feature = "rusty_alloc"))]
 fn seg_probe(_tag: &str) {}
+
+/// Resident KiB of `[p, p+len)` per mincore.
+#[cfg(feature = "rusty_alloc")]
+fn resident_kib(p: *mut u8, len: usize) -> usize {
+    let ps = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    let mut v = vec![0 as libc::c_char; len.div_ceil(ps)];
+    let r = unsafe { libc::mincore(p.cast(), len, v.as_mut_ptr()) };
+    if r != 0 {
+        return 0;
+    }
+    v.iter().filter(|b| (**b as i32) & 1 != 0).count() * ps / 1024
+}
 #[cfg(feature = "rusty_alloc")]
 fn seg_hw(it: u64) {
     rusty_alloc::init::for_each_heap(&mut |h| unsafe {

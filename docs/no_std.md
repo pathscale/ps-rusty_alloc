@@ -39,6 +39,12 @@ Apple, `pthread_getspecific`. They come from the `libc` crate with
 
 ## How the threaded parts work without std
 
+### Dependency boundary
+
+The no_std implementation supports the threaded allocator without enabling its optional std feature.
+
+### TLS implementation
+
 | Piece | With `std` | Without `std`, on unix |
 |---|---|---|
 | Thread-locals (heap pointer, backing heap, subprocess tag, re-entrancy guards) | `std::thread_local!` | `KeyLocal` (`src/key_local.rs`): one pthread key per variable |

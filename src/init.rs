@@ -933,7 +933,7 @@ unsafe fn thread_done_one(hb: *mut HeapBox) {
             let next = (*b).next;
             let seg = segment::segment_of(b.cast());
             let pg = segment::page_of(seg, b.cast());
-            crate::page::remote_free(pg, b);
+            crate::page::remote_free(seg, pg, b);
             b = next;
         }
         // Release the heap storage and clear the fast-path pointer. The

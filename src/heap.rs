@@ -592,8 +592,8 @@ impl Heap {
         // native for a 2 KiB tight alloc/free loop.
         //
         // It is worth **-20 to -30 %** the moment another thread is freeing into
-        // these pages. `free`, `local_free` and `xthread_free` are adjacent
-        // fields of a `#[repr(C)]` `Page`, so touching the queue front at all
+        // these pages. (Measured while `xthread_free` was a `Page` field next to
+        // `free` and `local_free`: touching the queue front at all
         // pulls a line the remote thread is invalidating -- doing only the
         // local half of the collect measured WORSE, not better, which is how
         // that was established.
@@ -2393,7 +2393,7 @@ pub unsafe fn visit_segment_blocks(
                 }
                 // Cross-thread chain: snapshot the head; nodes are stable
                 // once pushed (never unlinked until a collect).
-                let x = (*slot).xthread_free.load(Ordering::Acquire);
+                let x = crate::page::page_xfree_of(slot).load(Ordering::Acquire);
                 let mut b = crate::ptr_with_addr(slot.cast::<Block>(), x & !crate::page::XMASK);
                 while !b.is_null() {
                     mark(b);

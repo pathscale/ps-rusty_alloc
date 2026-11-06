@@ -25,6 +25,7 @@ categories = [
 ]
 license = "MIT"
 repository = "https://github.com/pathscale/ps-rusty_alloc"
+publish = ["crates-io"]
 resolver = "2"
 exclude = ["bench", "tools"]
 

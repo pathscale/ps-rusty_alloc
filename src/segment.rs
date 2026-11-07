@@ -598,7 +598,10 @@ unsafe fn restore_for_reuse(seg: *mut Segment) -> bool {
         }
         let base = seg.cast::<u8>().add(HEADER_SLICES * SEGMENT_SLICE_SIZE);
         let bytes = (*seg).total_size - HEADER_SLICES * SEGMENT_SLICE_SIZE;
-        if os::protect(base, bytes, false).is_err() || os::commit(base, bytes).is_err() {
+        // VirtualProtect requires every page in its range to be committed.
+        if ((*seg).purged_any && os::commit(base, bytes).is_err())
+            || ((*seg).guarded && os::protect(base, bytes, false).is_err())
+        {
             crate::stats::commit_failed();
             return false;
         }

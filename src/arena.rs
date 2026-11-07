@@ -112,17 +112,30 @@ pub fn parked_resident() -> (usize, usize) {
     (PARKED_RESIDENT.load(Ordering::Relaxed), bits)
 }
 
-/// ps: settle what the previous tenants of chunks `start..start + n` left,
-/// right after this caller claimed them: uncount parked chunks and recommit
-/// decommitted ones. Every claim path calls this, so no claimer can take a
-/// parked chunk without uncounting it.
+/// Settle the chunks this caller just claimed. If recommit fails, release the
+/// whole claim and return the index of the chunk that failed.
 ///
 /// # Safety
-/// `a` is a live descriptor and the caller has just set the `used` bits of
+/// `a` is a live descriptor and the caller owns the `used` bits of
 /// `start..start + n`.
-unsafe fn settle_claimed(a: *mut Arena, start: usize, n: usize) {
+unsafe fn settle_claimed(a: *mut Arena, start: usize, n: usize) -> Result<(), usize> {
     // SAFETY: per contract; bit indices lie inside the live chunks.
     unsafe {
+        for j in start..start + n {
+            let (w, m) = (j / WORD_BITS, (1 as BitWord) << (j % WORD_BITS));
+            if (*a).decommitted[w].load(Ordering::Acquire) & m == 0 {
+                continue;
+            }
+            if os::commit((*a).base.add(j * SEGMENT_SIZE), SEGMENT_SIZE).is_err() {
+                crate::stats::commit_failed();
+                for k in start..start + n {
+                    (*a).used[k / WORD_BITS].fetch_and(!(1 << (k % WORD_BITS)), Ordering::AcqRel);
+                }
+                return Err(j);
+            }
+            (*a).decommitted[w].fetch_and(!m, Ordering::AcqRel);
+        }
+        // Keep parked accounting intact until every chunk is usable.
         for j in start..start + n {
             let (w, m) = (j / WORD_BITS, (1 as BitWord) << (j % WORD_BITS));
             if (*a).parked[w].load(Ordering::Acquire) & m != 0
@@ -130,19 +143,28 @@ unsafe fn settle_claimed(a: *mut Arena, start: usize, n: usize) {
             {
                 PARKED_RESIDENT.fetch_sub(1, Ordering::Relaxed);
             }
-            if (*a).decommitted[w].load(Ordering::Acquire) & m != 0
-                && (*a).decommitted[w].fetch_and(!m, Ordering::AcqRel) & m != 0
-                && os::commit((*a).base.add(j * SEGMENT_SIZE), SEGMENT_SIZE).is_err()
-            {
-                crate::stats::commit_failed();
-            }
         }
     }
+    Ok(())
 }
 
 static ARENAS: [AtomicPtr<Arena>; MAX_ARENAS] =
     [const { AtomicPtr::new(ptr::null_mut()) }; MAX_ARENAS];
 static ARENA_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Check the incoming half-open range while MULTI_LOCK holds arena geometry stable.
+fn arena_range_overlaps(start: usize, end: usize, count: usize) -> bool {
+    ARENAS.iter().take(count).any(|slot| {
+        let a = slot.load(Ordering::Acquire);
+        // SAFETY: all slots below count hold live descriptors. Registration
+        // and extension both validate that the live range has a representable end.
+        unsafe {
+            let base = (*a).base.addr();
+            let chunks = (*a).chunks_live.load(Ordering::Relaxed);
+            start < base + chunks * SEGMENT_SIZE && base < end
+        }
+    })
+}
 
 /// Register a region as an arena. `base` must be SEGMENT_SIZE-aligned and
 /// `size` a whole number of chunks. Returns the arena id.
@@ -152,17 +174,22 @@ fn arena_register(
     exclusive: bool,
     owned: bool,
     numa_node: i32,
+    initially_dirty: bool,
 ) -> Result<i32, ()> {
     let chunks = size / SEGMENT_SIZE;
-    if chunks == 0 || chunks > MAX_CHUNKS || !base.addr().is_multiple_of(SEGMENT_SIZE) {
+    if chunks == 0
+        || chunks > MAX_CHUNKS
+        || !size.is_multiple_of(SEGMENT_SIZE)
+        || !base.addr().is_multiple_of(SEGMENT_SIZE)
+    {
         return Err(());
     }
+    let end = base.addr().checked_add(size).ok_or(())?;
     // Arena descriptor lives in its own OS pages (never in the allocator).
     let desc = os::alloc_aligned(core::mem::size_of::<Arena>(), os::page_size(), true, false)
         .map_err(|_| ())?;
     let a: *mut Arena = desc.ptr.cast();
-    // SAFETY: fresh zeroed mapping; the bitmap words' zero bit-pattern is valid, so
-    // only the scalar fields need writing.
+    // SAFETY: fresh zeroed mapping; the bitmap words' zero bit-pattern is valid.
     unsafe {
         (*a).base = base;
         (*a).size = size;
@@ -171,26 +198,25 @@ fn arena_register(
         (*a).exclusive = exclusive;
         (*a).owned = owned;
         (*a).numa_node = numa_node;
-    }
-    // CAS so `ARENA_COUNT` never exceeds `MAX_ARENAS` (no transient `ARENAS[32]`
-    // window for `arena_area`, and the overflow path frees the descriptor
-    // instead of leaking it).
-    loop {
-        let id = ARENA_COUNT.load(Ordering::Acquire);
-        if id >= MAX_ARENAS {
-            // SAFETY: `desc` is the descriptor mapping allocated above and
-            // never published (no `ARENAS` slot names it).
-            let _ = unsafe { os::free(desc) };
-            return Err(());
-        }
-        if ARENA_COUNT
-            .compare_exchange(id, id + 1, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            ARENAS[id].store(a, Ordering::Release);
-            return Ok(id as i32);
+        if initially_dirty {
+            for w in 0..chunks.div_ceil(WORD_BITS) {
+                let bits = (chunks - w * WORD_BITS).min(WORD_BITS);
+                (*a).dirty[w].store(BitWord::MAX >> (WORD_BITS - bits), Ordering::Relaxed);
+            }
         }
     }
+    lock_multi();
+    let id = ARENA_COUNT.load(Ordering::Relaxed);
+    if id >= MAX_ARENAS || arena_range_overlaps(base.addr(), end, id) {
+        MULTI_LOCK.store(false, Ordering::Release);
+        // SAFETY: no slot names this unpublished descriptor.
+        let _ = unsafe { os::free(desc) };
+        return Err(());
+    }
+    ARENAS[id].store(a, Ordering::Release);
+    ARENA_COUNT.store(id + 1, Ordering::Release);
+    MULTI_LOCK.store(false, Ordering::Release);
+    Ok(id as i32)
 }
 
 /// `mi_reserve_os_memory_ex`: reserve (and commit) fresh OS memory as an
@@ -222,7 +248,7 @@ pub fn reserve_os_memory_ex(
     // Eager commit (our segment model); `_commit=false` still reserves+commits
     // in v1 — recorded divergence, matches how segments consume chunks.
     let b = os::alloc_aligned(total, SEGMENT_SIZE, true, allow_large).map_err(|_| ())?;
-    match arena_register(b.ptr, total, exclusive, true, -1) {
+    match arena_register(b.ptr, total, exclusive, true, -1, !b.is_zero) {
         Ok(id) => Ok(id),
         Err(()) => {
             // SAFETY: `b` is the reservation made two lines up; a refused
@@ -281,24 +307,8 @@ pub fn manage_os_memory_ex(
     if crate::segment_map::contains(lo) || !crate::os::range_is_reserved(lo, span) {
         return Err(());
     }
-    // Conservative: treat managed memory as dirty (not-zero) — the dirty
-    // bitmap starts clear, so mark it at first alloc instead; simplest is to
-    // pre-mark every chunk dirty.
-    let id = arena_register(lo, hi - lo_addr, exclusive, false, numa_node)?;
-    let a = ARENAS[id as usize].load(Ordering::Acquire);
-    // SAFETY: freshly registered arena descriptor.
-    unsafe {
-        let chunks = (*a).chunks_live.load(Ordering::Acquire);
-        for w in 0..chunks.div_ceil(WORD_BITS) {
-            let bits = if (w + 1) * WORD_BITS <= chunks {
-                BitWord::MAX
-            } else {
-                ((1 as BitWord) << (chunks % WORD_BITS)) - 1
-            };
-            (*a).dirty[w].store(bits, Ordering::Relaxed);
-        }
-    }
-    Ok(id)
+    // Publish caller-provided chunks as dirty.
+    arena_register(lo, span, exclusive, false, numa_node, true)
 }
 
 /// Whether reserving a large default arena up front pays for itself.
@@ -412,6 +422,7 @@ fn chunk_alloc_inner(restrict_id: i32) -> Option<(*mut u8, bool)> {
             let chunks = (*a).chunks_live.load(Ordering::Acquire);
             let words = chunks.div_ceil(WORD_BITS);
             for w in 0..words {
+                let mut failed_mask = 0;
                 loop {
                     let cur = (*a).used[w].load(Ordering::Acquire);
                     let limit = if (w + 1) * WORD_BITS <= chunks {
@@ -419,7 +430,7 @@ fn chunk_alloc_inner(restrict_id: i32) -> Option<(*mut u8, bool)> {
                     } else {
                         chunks % WORD_BITS
                     };
-                    let free_bits = !cur
+                    let free_bits = !cur & !failed_mask
                         & if limit == WORD_BITS {
                             BitWord::MAX
                         } else {
@@ -441,7 +452,10 @@ fn chunk_alloc_inner(restrict_id: i32) -> Option<(*mut u8, bool)> {
                         continue;
                     }
                     let idx = w * WORD_BITS + bit;
-                    settle_claimed(a, idx, 1);
+                    if settle_claimed(a, idx, 1).is_err() {
+                        failed_mask |= 1 << bit;
+                        continue;
+                    }
                     let was_dirty =
                         (*a).dirty[w].fetch_or(1 << bit, Ordering::AcqRel) & (1 << bit) != 0;
                     let p = (*a).base.add(idx * SEGMENT_SIZE);
@@ -453,7 +467,17 @@ fn chunk_alloc_inner(restrict_id: i32) -> Option<(*mut u8, bool)> {
     None
 }
 
+// Serializes arena range publication and multi-chunk claims.
 static MULTI_LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn lock_multi() {
+    while MULTI_LOCK
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+}
 
 /// Allocate `n` CONTIGUOUS chunks (huge blocks). Single spinlock for the
 /// multi-bit search; the single-chunk path stays lock-free.
@@ -484,12 +508,7 @@ pub fn chunk_alloc_n(restrict_id: i32, n: usize) -> Option<(*mut u8, bool)> {
 
 #[allow(clippy::needless_range_loop)] // indexed scan over a fixed atomic table
 fn chunk_alloc_n_inner(restrict_id: i32, n: usize) -> Option<(*mut u8, bool)> {
-    while MULTI_LOCK
-        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        core::hint::spin_loop();
-    }
+    lock_multi();
     let result = (|| {
         let count = ARENA_COUNT.load(Ordering::Acquire).min(MAX_ARENAS);
         for id in 0..count {
@@ -556,7 +575,12 @@ fn chunk_alloc_n_inner(restrict_id: i32, n: usize) -> Option<(*mut u8, bool)> {
                                 cur_w = usize::MAX; // reload the live word
                                 continue;
                             }
-                            settle_claimed(a, start, n);
+                            if let Err(failed) = settle_claimed(a, start, n) {
+                                run = 0;
+                                idx = failed + 1;
+                                cur_w = usize::MAX;
+                                continue;
+                            }
                             let dirty_prev = (*a).dirty[w].fetch_or(mask, Ordering::AcqRel);
                             let p = (*a).base.add(start * SEGMENT_SIZE);
                             return Some((p, dirty_prev & mask == 0));
@@ -588,7 +612,12 @@ fn chunk_alloc_n_inner(restrict_id: i32, n: usize) -> Option<(*mut u8, bool)> {
                             cur_w = usize::MAX; // reload the live word
                             continue;
                         }
-                        settle_claimed(a, start, n);
+                        if let Err(failed) = settle_claimed(a, start, n) {
+                            run = 0;
+                            idx = failed + 1;
+                            cur_w = usize::MAX;
+                            continue;
+                        }
                         let mut any_dirty = false;
                         for j in start..=idx {
                             any_dirty |= (*a).dirty[j / WORD_BITS]
@@ -755,19 +784,15 @@ pub(crate) fn adopt_os_block(ptr: *mut u8, size: usize) -> Option<i32> {
     if size == 0 || !addr.is_multiple_of(SEGMENT_SIZE) || !size.is_multiple_of(SEGMENT_SIZE) {
         return None;
     }
+    let end = addr.checked_add(size)?;
     let n = size / SEGMENT_SIZE;
-    // Serialise against other adopters and the multi-chunk allocator; the
-    // lock-free single-chunk paths are ordered by the Release publication
-    // below. (On wasm, the only platform whose os::free reaches here, there
-    // is exactly one thread anyway.)
-    while MULTI_LOCK
-        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        core::hint::spin_loop();
+    lock_multi();
+    let count = ARENA_COUNT.load(Ordering::Relaxed);
+    if arena_range_overlaps(addr, end, count) {
+        MULTI_LOCK.store(false, Ordering::Release);
+        return None;
     }
     let id = (|| {
-        let count = ARENA_COUNT.load(Ordering::Acquire).min(MAX_ARENAS);
         for id in 0..count {
             let a = ARENAS[id].load(Ordering::Acquire);
             if a.is_null() {
@@ -799,17 +824,8 @@ pub(crate) fn adopt_os_block(ptr: *mut u8, size: usize) -> Option<i32> {
     if id.is_some() {
         return id;
     }
-    // No adjacent arena: register the block as its own. Chunks start free;
-    // pre-mark them dirty exactly as manage_os_memory_ex does.
-    let id = arena_register(ptr, size, false, true, -1).ok()?;
-    let a = ARENAS[id as usize].load(Ordering::Acquire);
-    // SAFETY: freshly registered live descriptor.
-    unsafe {
-        for j in 0..n {
-            (*a).dirty[j / WORD_BITS].fetch_or(1 << (j % WORD_BITS), Ordering::AcqRel);
-        }
-    }
-    Some(id)
+    // Register a fresh arena, rechecking overlap under the lock.
+    arena_register(ptr, size, false, true, -1, true).ok()
 }
 
 /// `mi_arena_area`: the arena's base and size, or null.

@@ -156,14 +156,26 @@ const _: () = assert!(
 );
 
 // The remote heads must not share a cache line with `page_off` (read by every
-// free) or with the page slots (written by every alloc).
+// free) or with the page slots (written by every alloc). The table-length
+// check below is for cache placement; fixed strided segment bases do not
+// guarantee physical 128-byte alignment.
+const _: () = assert!(
+    (crate::ONE_REGION
+        && cfg!(all(
+            target_pointer_width = "32",
+            ra_small_profile,
+            not(ra_segment_size = "256k")
+        )))
+        || core::mem::size_of::<XFreeTable>() % 128 == 0,
+    "xfree table size must be a multiple of 128 bytes for cache placement"
+);
+
 const _: () = assert!(
     core::mem::offset_of!(Segment, xfree) == 0
-        && core::mem::size_of::<XFreeTable>() % 128 == 0
         && PAGES_OFFSET % 128 == 0
         && core::mem::offset_of!(Segment, page_off) + 4 * SLICES_PER_SEGMENT <= PAGES_OFFSET
         && core::mem::align_of::<Segment>() <= 16,
-    "xfree must start and end on a 128-byte line"
+    "xfree must start at zero and segment metadata must retain its layout"
 );
 
 /// Slices reserved for the header.

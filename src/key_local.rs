@@ -168,10 +168,12 @@ impl<T: KeyWord> KeyLocal<T> {
 /// Nullable pointer slot for the default heap hot path.
 /// NULL is the initial value; the caller maps it to the empty-heap sentinel.
 /// Key creation and publication remain owned by the general KeyLocal.
+#[cfg(not(all(target_arch = "x86_64", target_os = "linux", not(miri))))]
 pub(crate) struct NullableKeyLocal<T> {
     inner: KeyLocal<*mut T>,
 }
 
+#[cfg(not(all(target_arch = "x86_64", target_os = "linux", not(miri))))]
 impl<T> NullableKeyLocal<T> {
     pub(crate) const fn new() -> Self {
         Self { inner: KeyLocal::new(Cell::new(ptr::null_mut())) }

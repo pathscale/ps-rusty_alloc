@@ -348,24 +348,42 @@ mod heap_tls {
 #[cfg(not(all(target_arch = "x86_64", target_os = "linux", not(miri))))]
 mod heap_tls {
     use super::HeapBox;
+    #[cfg(not(all(not(feature = "std"), unix, not(ra_single_threaded))))]
     use core::cell::Cell;
 
+    #[cfg(all(not(feature = "std"), unix, not(ra_single_threaded)))]
+    static HEAP_PTR: crate::key_local::NullableKeyLocal<HeapBox> =
+        crate::key_local::NullableKeyLocal::new();
+
+    #[cfg(not(all(not(feature = "std"), unix, not(ra_single_threaded))))]
     ra_thread_local! {
-        /// Fast-path heap pointer. Const-init + !Drop ⇒ plain TLS access, no
-        /// lazy-init branch, no allocation ever. Initialised to the
-        /// empty-heap SENTINEL (never null) so the malloc fast path can read
-        /// through it unconditionally; see `EMPTY_HEAP_BOX`.
+        /// Fast-path heap pointer, initialized to the empty sentinel.
         static HEAP_PTR: Cell<*mut HeapBox> = const { Cell::new(super::empty_heap_box_ptr()) };
     }
 
     #[inline(always)]
     pub fn get() -> *mut HeapBox {
-        HEAP_PTR.with(|c| c.get())
+        #[cfg(all(not(feature = "std"), unix, not(ra_single_threaded)))]
+        {
+            let hb = HEAP_PTR.get();
+            if hb.is_null() { super::empty_heap_box_ptr() } else { hb }
+        }
+        #[cfg(not(all(not(feature = "std"), unix, not(ra_single_threaded))))]
+        {
+            HEAP_PTR.with(|c| c.get())
+        }
     }
 
     #[inline(always)]
     pub fn set(hb: *mut HeapBox) {
-        HEAP_PTR.with(|c| c.set(hb));
+        #[cfg(all(not(feature = "std"), unix, not(ra_single_threaded)))]
+        {
+            HEAP_PTR.set(hb);
+        }
+        #[cfg(not(all(not(feature = "std"), unix, not(ra_single_threaded))))]
+        {
+            HEAP_PTR.with(|c| c.set(hb));
+        }
     }
 }
 
@@ -915,7 +933,7 @@ unsafe fn thread_done_one(hb: *mut HeapBox) {
             let next = (*b).next;
             let seg = segment::segment_of(b.cast());
             let pg = segment::page_of(seg, b.cast());
-            crate::page::remote_free(pg, b);
+            crate::page::remote_free(seg, pg, b);
             b = next;
         }
         // Release the heap storage and clear the fast-path pointer. The

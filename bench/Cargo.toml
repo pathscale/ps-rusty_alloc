@@ -11,7 +11,7 @@ publish = false
 # mimalloc (C) is the reference baseline ONLY and exists only in this crate.
 
 [dependencies]
-rusty_alloc = { package = "ps-rusty_alloc", path = "..", optional = true }
+rusty_alloc = { package = "ps-rusty_alloc", path = "..", optional = true, default-features = false }
 mimalloc = { version = "0.1.52", optional = true, default-features = false }
 smmalloc = { version = "7.6.13", optional = true }
 baby-mimalloc = { version = "0.2.1", optional = true, features = ["mmap", "spin_mutex"] }
@@ -23,6 +23,8 @@ libc = "0.2"
 system = []
 mimalloc = ["dep:mimalloc"]
 rusty_alloc = ["dep:rusty_alloc"]
+# Explicit std allocator baseline for paired comparisons with the same benchmark program.
+rusty_alloc_std = ["rusty_alloc", "rusty_alloc/std"]
 smalloc = ["dep:smmalloc"]
 baby_mimalloc = ["dep:baby-mimalloc"]
 rlsf = ["dep:rlsf"]

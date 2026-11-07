@@ -365,15 +365,19 @@ impl Default for DelayedList {
 
 /// Page metadata. Lives in the owning segment's header slice; the payload
 /// ("page area") is the corresponding slice span.
+///
+/// `#[repr(C)]`: the owner-hot fields (`free`, `local_free`, `next`, `prev`,
+/// `used`, `capacity`, then `area`, `slice_count`, `slice_offset`, `bin` and
+/// `flags`) come first so the fast paths touch the first 54 bytes only, and
+/// the read-mostly fields follow `heap_tag`. The cross-thread free word is NOT
+/// here: it lives in `Segment::xfree` (see [`page_xfree`]), so a remote free
+/// never writes to a line the owner's `page_pop` is using.
+#[repr(C)]
 pub struct Page {
     /// Fast-path free list (owner-only).
     pub free: *mut Block,
     /// Owner-thread frees since last collect (owner-only).
     pub local_free: *mut Block,
-    /// Cross-thread word: block-list head | 2-bit flag (see module docs).
-    pub xthread_free: AtomicUsize,
-    /// Address of the owning heap's [`DelayedList`] (0 while unowned).
-    pub xheap: AtomicUsize,
     /// Next page in its queue (owner-only).
     pub next: *mut Page,
     /// Previous page in its queue (owner-only).
@@ -383,10 +387,6 @@ pub struct Page {
     pub used: u32,
     /// Blocks handed to the free list so far (lazy extension high-water mark).
     pub capacity: u32,
-    /// Maximum blocks this page can hold.
-    pub reserved: u32,
-    /// Block size in bytes (0 = free span / unused slot).
-    pub block_size: usize,
     /// Payload start of this page (`seg + idx * SEGMENT_SLICE_SIZE`), cached so
     /// the refill path never has to recover it from the slot pointer.
     ///
@@ -440,7 +440,7 @@ pub struct Page {
     ///
     /// **It costs exactly one instruction on the free fast path, measured.**
     /// A plain field read let LLVM fold the load into the test's memory
-    /// operand (`test BYTE PTR [pg+0x4d], 0xf`); it will not fold an ATOMIC
+    /// operand (`test BYTE PTR [pg+0x35], 0xf`); it will not fold an ATOMIC
     /// load, so the sequence becomes `movzx` + `test`. Cost: batch_lifo
     /// 59.17 → 60.17 Ir/op, and every other operation +1.00 exactly. That is
     /// the same trade this crate already made for double-free detection
@@ -460,6 +460,12 @@ pub struct Page {
     /// `mi_abandoned_visit_blocks` can filter (upstream stores it on the page
     /// for the same reason).
     pub heap_tag: i32,
+    /// Maximum blocks this page can hold.
+    pub reserved: u32,
+    /// Block size in bytes (0 = free span / unused slot).
+    pub block_size: usize,
+    /// Address of the owning heap's [`DelayedList`] (0 while unowned).
+    pub xheap: AtomicUsize,
     /// Per-page free-list encoding keys (`secure` builds only; zero elsewhere).
     #[cfg(feature = "secure")]
     pub keys: [usize; 2],
@@ -547,7 +553,6 @@ impl Page {
         Page {
             free: ptr::null_mut(),
             local_free: ptr::null_mut(),
-            xthread_free: AtomicUsize::new(0),
             xheap: AtomicUsize::new(0),
             next: ptr::null_mut(),
             prev: ptr::null_mut(),
@@ -605,6 +610,51 @@ pub static EMPTY_PAGE: EmptyPage = EmptyPage(Page::empty_sentinel());
 #[inline]
 pub const fn empty_page_ptr() -> *mut Page {
     (&raw const EMPTY_PAGE.0).cast_mut()
+}
+
+/// The remote-free word the empty sentinel answers with: always 0 (no chain,
+/// flag NORMAL). Nothing ever stores to it, because the sentinel is never a
+/// remote-free target and never carries a protocol flag.
+static XFREE_EMPTY: AtomicUsize = AtomicUsize::new(0);
+
+/// The cross-thread free word of `page`: block-list head | 2-bit flag (see
+/// module docs). It is slot `page_index(seg, page)` of `Segment::xfree`, not a
+/// field of `Page`, so remote CASes land on their own cache lines.
+///
+/// The returned reference is valid for as long as the segment is (the table
+/// has the header's lifetime); the `'static` is the unbounded lifetime of a
+/// dereferenced raw pointer, not a promise.
+///
+/// # Safety
+/// `seg` must be the live segment that owns `page`, and `page` a real page
+/// slot of it (span start with `area` set), not the empty sentinel.
+#[inline(always)]
+pub unsafe fn page_xfree(seg: *mut crate::segment::Segment, page: *mut Page) -> &'static AtomicUsize {
+    // SAFETY: per the contract `idx < SLICES_PER_SEGMENT` (it is the slice
+    // index of the page's payload start), and `xfree` is an in-header table of
+    // that many atomics.
+    unsafe {
+        let idx = crate::segment::page_index(seg, page);
+        &*(&raw const (*seg).xfree).cast::<AtomicUsize>().add(idx)
+    }
+}
+
+/// [`page_xfree`] for owner-side callers that do not hold the segment.
+///
+/// This is the only place the empty sentinel is special-cased: it has no
+/// segment, so it maps to a static word that always reads 0. The alloc fast
+/// path never calls this.
+///
+/// # Safety
+/// `page` is either the empty sentinel or a real page slot of a live segment.
+#[inline]
+pub unsafe fn page_xfree_of(page: *mut Page) -> &'static AtomicUsize {
+    if page == empty_page_ptr() {
+        return &XFREE_EMPTY;
+    }
+    // SAFETY: a page slot lives inside its segment's header, so masking it
+    // recovers the owning segment.
+    unsafe { page_xfree(crate::segment::segment_of(page.cast()), page) }
 }
 
 /// Pop a block off the fast list. Returns null when dry (→ generic path).
@@ -772,7 +822,11 @@ pub(crate) fn corrupt_free_list_abort() -> ! {
 // `remote_free` +1,868,800, net +373,760 on the cross-thread op, because a
 // workload where this function matters is one where every free reaches it, so
 // the call is paid every time AND the callee grows a frame of its own.
-pub unsafe fn remote_free(page: *mut Page, block: *mut Block) {
+pub unsafe fn remote_free(
+    seg: *mut crate::segment::Segment,
+    page: *mut Page,
+    block: *mut Block,
+) {
     // Unreachable on a single-context build (`alloc::free` folds every free
     // to local there); if it runs anyway, the single-thread assertion the
     // target made was false.
@@ -782,24 +836,24 @@ pub unsafe fn remote_free(page: *mut Page, block: *mut Block) {
     // Both arms below detect a double free with one compare and `break` to
     // the single abort AFTER the loop; see `remote_double_free` for why that
     // abort is a tail call and not a diverging one.
+    // SAFETY: `seg` owns `page` (caller contract); the word lives in the
+    // segment header's `xfree` table, which outlives the free in flight
+    // (`wait_no_remote_in_flight` holds a release back until it ends).
+    let xfree = unsafe { page_xfree(seg, page) };
     'push: loop {
-        // SAFETY: xthread_free/xheap are the designed cross-thread fields.
-        let x = unsafe { (*page).xthread_free.load(Ordering::Acquire) };
+        // SAFETY: xfree/xheap are the designed cross-thread fields.
+        let x = xfree.load(Ordering::Acquire);
         match x & XMASK {
             XFLAG_DELAYED => {
                 // Claim the transient FREEING state before touching the heap.
-                // SAFETY: atomic field.
-                let claimed = unsafe {
-                    (*page)
-                        .xthread_free
-                        .compare_exchange_weak(
-                            x,
-                            (x & !XMASK) | XFLAG_FREEING,
-                            Ordering::AcqRel,
-                            Ordering::Relaxed,
-                        )
-                        .is_ok()
-                };
+                let claimed = xfree
+                    .compare_exchange_weak(
+                        x,
+                        (x & !XMASK) | XFLAG_FREEING,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok();
                 if claimed {
                     // SAFETY: while FREEING is held the abandoner cannot tear
                     // the heap down (it spins us out first) — xheap is valid.
@@ -856,9 +910,8 @@ pub unsafe fn remote_free(page: *mut Page, block: *mut Block) {
                                 XFLAG_NORMAL
                             };
                         loop {
-                            let y = (*page).xthread_free.load(Ordering::Acquire);
-                            if (*page)
-                                .xthread_free
+                            let y = xfree.load(Ordering::Acquire);
+                            if xfree
                                 .compare_exchange_weak(
                                     y,
                                     (y & !XMASK) | restore,
@@ -892,8 +945,7 @@ pub unsafe fn remote_free(page: *mut Page, block: *mut Block) {
                 // free-list representation.
                 unsafe {
                     block_set_next(page, block, crate::ptr_with_addr(block, x & !XMASK));
-                    if (*page)
-                        .xthread_free
+                    if xfree
                         .compare_exchange_weak(
                             x,
                             (block as usize) | flag,
@@ -938,20 +990,18 @@ fn remote_double_free() {
 /// Only the page's owner (or the abandoner during teardown, or the adopter
 /// after taking ownership) may call this.
 pub unsafe fn page_set_flag(page: *mut Page, flag: usize) {
+    // SAFETY: owner/abandoner/adopter contract: `page` is a real slot of a
+    // live segment.
+    let xfree = unsafe { page_xfree_of(page) };
     loop {
-        // SAFETY: atomic field.
-        let x = unsafe { (*page).xthread_free.load(Ordering::Acquire) };
+        let x = xfree.load(Ordering::Acquire);
         if x & XMASK == XFLAG_FREEING {
             core::hint::spin_loop();
             continue;
         }
-        // SAFETY: atomic field.
-        let ok = unsafe {
-            (*page)
-                .xthread_free
-                .compare_exchange_weak(x, (x & !XMASK) | flag, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-        };
+        let ok = xfree
+            .compare_exchange_weak(x, (x & !XMASK) | flag, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok();
         if ok {
             return;
         }
@@ -1011,11 +1061,12 @@ unsafe fn page_collect_impl<const SET_FLAG: bool>(page: *mut Page, flag: usize) 
         // setup as well as the test; this is the test alone, straight-line.
         // Steal the cross-thread chain, preserving the protocol flag — or,
         // when SET_FLAG, replacing it in the same CAS.
-        if !SET_FLAG && ((*page).xthread_free.load(Ordering::Acquire) & !XMASK) == 0 {
+        let xfree = page_xfree_of(page);
+        if !SET_FLAG && (xfree.load(Ordering::Acquire) & !XMASK) == 0 {
             return false;
         }
         loop {
-            let x = (*page).xthread_free.load(Ordering::Acquire);
+            let x = xfree.load(Ordering::Acquire);
             if SET_FLAG && x & XMASK == XFLAG_FREEING {
                 // A remote free is mid-flight; the flag must not be rewritten
                 // underneath it (this is `page_set_flag`'s wait, inherited).
@@ -1025,8 +1076,7 @@ unsafe fn page_collect_impl<const SET_FLAG: bool>(page: *mut Page, flag: usize) 
             let head = (x & !XMASK) as *mut Block;
             if head.is_null() {
                 if SET_FLAG
-                    && (*page)
-                        .xthread_free
+                    && xfree
                         .compare_exchange_weak(x, flag, Ordering::AcqRel, Ordering::Relaxed)
                         .is_err()
                 {
@@ -1035,8 +1085,7 @@ unsafe fn page_collect_impl<const SET_FLAG: bool>(page: *mut Page, flag: usize) 
                 return false;
             }
             let want = if SET_FLAG { flag } else { x & XMASK };
-            if (*page)
-                .xthread_free
+            if xfree
                 .compare_exchange_weak(x, want, Ordering::AcqRel, Ordering::Relaxed)
                 .is_err()
             {

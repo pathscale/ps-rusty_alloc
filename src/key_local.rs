@@ -165,6 +165,34 @@ impl<T: KeyWord> KeyLocal<T> {
     }
 }
 
+/// Nullable pointer slot for the default heap hot path.
+/// NULL is the initial value; the caller maps it to the empty-heap sentinel.
+/// Key creation and publication remain owned by the general KeyLocal.
+pub(crate) struct NullableKeyLocal<T> {
+    inner: KeyLocal<*mut T>,
+}
+
+impl<T> NullableKeyLocal<T> {
+    pub(crate) const fn new() -> Self {
+        Self { inner: KeyLocal::new(Cell::new(ptr::null_mut())) }
+    }
+
+    #[inline(always)]
+    pub(crate) fn get(&self) -> *mut T {
+        let k = self.inner.key.load(Ordering::Acquire);
+        if k == 0 {
+            return ptr::null_mut();
+        }
+        // Published keys are never deleted; this thread owns its TSD slot.
+        slot_get((k - 1) as libc::pthread_key_t).cast::<T>()
+    }
+
+    #[inline(always)]
+    pub(crate) fn set(&self, value: *mut T) {
+        self.inner.set(value);
+    }
+}
+
 /// `pthread_getspecific(key)`, inline on Apple targets.
 #[inline(always)]
 fn slot_get(key: libc::pthread_key_t) -> *mut c_void {

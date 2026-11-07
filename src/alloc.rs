@@ -1148,7 +1148,7 @@ pub unsafe fn free_inline(p: *mut u8) {
                 remote = label {
                     // SAFETY: `pg` is the live page this free resolved; a
                     // non-owning thread hands the block to its owner.
-                    unsafe { remote_free(pg, p.cast::<Block>()) };
+                    unsafe { remote_free(seg, pg, p.cast::<Block>()) };
                     return;
                 },
                 options(nostack, readonly),
@@ -1158,7 +1158,7 @@ pub unsafe fn free_inline(p: *mut u8) {
             // ordinary comparison below.
             #[cfg(not(all(target_arch = "x86_64", target_os = "linux", not(miri))))]
             if !local {
-                remote_free(pg, p.cast::<Block>());
+                remote_free(seg, pg, p.cast::<Block>());
                 return;
             }
             {
@@ -1448,7 +1448,7 @@ unsafe fn free_general(p: *mut u8, seg: *mut Segment, pg: *mut Page, owner_tid: 
                 tid = in(reg) owner_tid,
                 remote = label {
                     // SAFETY: `pg` is the live page this free resolved.
-                    unsafe { remote_free(pg, block.cast::<Block>()) };
+                    unsafe { remote_free(seg, pg, block.cast::<Block>()) };
                     return;
                 },
                 options(nostack, readonly),
@@ -1464,7 +1464,7 @@ unsafe fn free_general(p: *mut u8, seg: *mut Segment, pg: *mut Page, owner_tid: 
             // Remote: the loom-modeled protocol (huge pages sit DELAYED, so
             // this lands on the owner's delayed list and the owner's
             // heartbeat performs the release + unlink).
-            remote_free(pg, block.cast::<Block>());
+            remote_free(seg, pg, block.cast::<Block>());
         }
     }
 }

@@ -138,6 +138,12 @@ pub struct Segment {
     _pages_pad: [u64; PAGES_PAD_WORDS],
     /// One metadata slot per slice; a span's slot is its first slice.
     pub pages: [Page; SLICES_PER_SEGMENT],
+    /// Start of the readable core block after alignment or guard placement.
+    #[cfg(feature = "debug_checks")]
+    pub(crate) debug_huge_start: *mut u8,
+    /// Exclusive end of the readable core block in a huge segment.
+    #[cfg(feature = "debug_checks")]
+    pub(crate) debug_huge_end: usize,
 }
 
 /// Byte offset from a segment's base to its slot array — the base value stored
@@ -166,13 +172,13 @@ const _: () = assert!(
             ra_small_profile,
             not(ra_segment_size = "256k")
         )))
-        || core::mem::size_of::<XFreeTable>() % 128 == 0,
+        || core::mem::size_of::<XFreeTable>().is_multiple_of(128),
     "xfree table size must be a multiple of 128 bytes for cache placement"
 );
 
 const _: () = assert!(
     core::mem::offset_of!(Segment, xfree) == 0
-        && PAGES_OFFSET % 128 == 0
+        && PAGES_OFFSET.is_multiple_of(128)
         && core::mem::offset_of!(Segment, page_off) + 4 * SLICES_PER_SEGMENT <= PAGES_OFFSET
         && core::mem::align_of::<Segment>() <= 16,
     "xfree must start at zero and segment metadata must retain its layout"
@@ -474,7 +480,15 @@ unsafe fn scrub_recycled(seg: *mut Segment, slots: usize, owner_table: bool) {
         // read as the next tenant's. A Normal segment zeroes them all; a Huge
         // one only the entries it can reach (slot 1 is its page).
         let xf = (&raw mut (*seg).xfree).cast::<usize>();
-        core::ptr::write_bytes(xf, 0, if owner_table { SLICES_PER_SEGMENT } else { slots });
+        core::ptr::write_bytes(
+            xf,
+            0,
+            if owner_table {
+                SLICES_PER_SEGMENT
+            } else {
+                slots
+            },
+        );
         core::ptr::write_bytes((&raw mut (*seg).pages).cast::<Page>(), 0, slots);
     }
 }
@@ -1126,6 +1140,18 @@ pub fn huge_alloc(
     offset: usize,
     arena_id: i32,
 ) -> Result<(*mut Segment, *mut u8), PrimError> {
+    huge_alloc_with_guard(size, align, offset, arena_id, None)
+}
+
+/// For guarded requests, `size` includes the final guard page and
+/// `guarded_size` is the object size before page rounding.
+pub(crate) fn huge_alloc_with_guard(
+    size: usize,
+    align: usize,
+    offset: usize,
+    arena_id: i32,
+    guarded_size: Option<usize>,
+) -> Result<(*mut Segment, *mut u8), PrimError> {
     // A garbage alignment is EINVAL, not a `debug_assert!`: this is a safe
     // `pub fn`, and the mask arithmetic below is only sound for a power of
     // two. Cold path (dedicated segment), so the two compares are free.
@@ -1210,7 +1236,6 @@ pub fn huge_alloc(
         is_large: false,
         is_zero: mem_zero,
     };
-    segment_map::register_range(seg.addr(), b.size);
     // SAFETY: fresh zeroed reservation ≥ header + size + extra.
     unsafe {
         (*seg).kind = SegmentKind::Huge;
@@ -1228,13 +1253,13 @@ pub fn huge_alloc(
         // `area + offset + align` can wrap for a caller-chosen offset; that is
         // an unsatisfiable request, not a block placed by wrapped arithmetic.
         let Some(addr) = crate::bins::aligned_at_from(area.addr(), offset, align) else {
-            // SAFETY: the reservation is registered and unused; no block escaped.
-            let _ = huge_free(seg);
+            // SAFETY: the reservation is unused and unpublished.
+            let _ = huge_release(seg, false);
             return Err(0);
         };
         if addr < area.addr() {
             // SAFETY: as the overflow arm.
-            let _ = huge_free(seg);
+            let _ = huge_release(seg, false);
             return Err(0);
         }
         let block = area.with_addr(addr);
@@ -1261,6 +1286,11 @@ pub fn huge_alloc(
         // `block_size`; `usable_size` now agrees with `mi_usable_size` here.
         let capacity = b.size - (block.addr() - seg.addr());
         (*page).block_size = crate::prim::align_up(size.max(1), SEGMENT_SLICE_SIZE).min(capacity);
+        #[cfg(feature = "debug_checks")]
+        {
+            (*seg).debug_huge_start = block;
+            (*seg).debug_huge_end = block.addr() + (*page).block_size;
+        }
         (*page).used = 1;
         (*page).capacity = 1;
         (*page).reserved = 1;
@@ -1298,7 +1328,26 @@ pub fn huge_alloc(
             *tab.add(j) = owner;
             j += 1;
         }
-        Ok((seg, block))
+        let mut result = block;
+        if let Some(object_size) = guarded_size {
+            let ps = os::page_size();
+            let guard = block.add(size - ps);
+            if os::protect(guard, ps, true).is_ok() {
+                (*seg).guarded = true;
+                result = guard.sub(object_size);
+                (*page)
+                    .flags
+                    .fetch_or(crate::page::pflags::HAS_ALIGNED, Ordering::Relaxed);
+                #[cfg(feature = "debug_checks")]
+                {
+                    (*seg).debug_huge_start = result;
+                    (*seg).debug_huge_end = guard.addr();
+                }
+            }
+        }
+        // Publish only after the final readable extent and guard are set.
+        segment_map::register_range(seg.addr(), b.size);
+        Ok((seg, result))
     }
 }
 
@@ -1307,14 +1356,23 @@ pub fn huge_alloc(
 /// # Safety
 /// `seg` must be a live Huge segment with no live references into it.
 pub unsafe fn huge_free(seg: *mut Segment) -> Result<(), PrimError> {
+    // SAFETY: per contract, seg is a live published Huge segment.
+    unsafe { huge_release(seg, true) }
+}
+
+/// Release a Huge reservation. Placement failure can reach this before
+/// publication, with only the segment scalars and the scrubbed slot live.
+unsafe fn huge_release(seg: *mut Segment, published: bool) -> Result<(), PrimError> {
     // SAFETY: per contract; reconstruct the OsBlock we allocated with.
     unsafe {
         // SAME BARRIER AS `segment_free`, and this is the path that actually
         // raced: a huge segment recycles through `chunk_free_n` WITHOUT going
         // through `segment_free`, so guarding only there left the hole open.
         // Every route by which memory can reach an arena needs it.
-        wait_no_remote_in_flight(seg);
-        segment_map::unregister_range(seg.addr(), (*seg).total_size);
+        if published {
+            wait_no_remote_in_flight(seg);
+            segment_map::unregister_range(seg.addr(), (*seg).total_size);
+        }
         // Arena-backed huge blocks recycle their contiguous chunks — but the
         // memory must be handed back in a USABLE state: lift any guard-page
         // protection and restore commitment first. Skipping this recycles an

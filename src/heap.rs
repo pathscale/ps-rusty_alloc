@@ -155,6 +155,13 @@ impl Default for Heap {
 pub const LARGE_CACHE_MAX_SLICES: usize = (4 << 20) / SEGMENT_SLICE_SIZE;
 
 /// The heap.
+#[cfg_attr(
+    feature = "debug_checks",
+    expect(
+        clippy::struct_excessive_bools,
+        reason = "the debug-only destroyability flag is independent of the other flags"
+    )
+)]
 pub struct Heap {
     /// Page queues, indexed by bin; `pages[BIN_FULL]` parks full pages.
     pub pages: [PageQueue; BIN_COUNT],
@@ -173,6 +180,8 @@ pub struct Heap {
     /// Huge (dedicated-segment) allocations owned by this heap, so
     /// delete/destroy/abandon can account for them.
     pub huge_segments: *mut Segment,
+    #[cfg(feature = "debug_checks")]
+    pub(crate) debug_destroyable: bool,
     /// One freed large span (single-block, unqueued) kept carved for the next
     /// large allocation of the SAME slice count, or null. A large block is
     /// otherwise carved fresh on every allocation and retired on every free:
@@ -268,6 +277,8 @@ impl Heap {
             empty_segments: 0,
             delayed: &raw const EMPTY_DELAYED,
             huge_segments: ptr::null_mut(),
+            #[cfg(feature = "debug_checks")]
+            debug_destroyable: false,
             large_cache: ptr::null_mut(),
             large_freed: false,
             arena_id: -1,
@@ -718,7 +729,7 @@ impl Heap {
             let r = if size <= LARGE_OBJ_SIZE_MAX {
                 self.large_alloc(size)
             } else {
-                self.huge_alloc(size, 8, 0)
+                self.huge_alloc(size, 8, 0, None)
             };
             if r.0.is_null() {
                 return self.malloc_generic_retry(size);
@@ -1052,7 +1063,7 @@ impl Heap {
             // exists so a huge orphan backlog cannot stall one allocation; it
             // is not a reclaim budget (see MAX_ADOPT at the top of the fn).
             for _ in 0..MAX_ADOPT {
-                let aseg = crate::init::abandoned_pop();
+                let aseg = self.pop_abandoned();
                 if aseg.is_null() {
                     break;
                 }
@@ -1079,6 +1090,23 @@ impl Heap {
             ra_debug_assert!(!p.is_null());
             Some((p, fresh))
         }
+    }
+
+    #[cfg_attr(
+        not(feature = "debug_checks"),
+        allow(
+            clippy::unused_self,
+            reason = "destroyability is checked in debug builds"
+        )
+    )]
+    fn pop_abandoned(&self) -> *mut Segment {
+        // A destroyable heap must never bulk-release a segment containing
+        // blocks quarantined by another thread before adoption.
+        #[cfg(feature = "debug_checks")]
+        if self.debug_destroyable {
+            return ptr::null_mut();
+        }
+        crate::init::abandoned_pop()
     }
 
     /// Large objects (64 KiB..16 MiB): one single-block page spanning enough
@@ -1157,29 +1185,7 @@ impl Heap {
         let Some(need) = payload.checked_add(ps) else {
             return (ptr::null_mut(), false);
         };
-        // huge_alloc gives us a dedicated segment with a page-aligned block.
-        let (block, _z) = self.huge_alloc(need, ps, 0);
-        if block.is_null() {
-            return (ptr::null_mut(), false);
-        }
-        // SAFETY: block is the start of a fresh dedicated reservation with at
-        // least payload + one page of committed memory.
-        unsafe {
-            let guard = block.add(payload);
-            if crate::os::protect(guard, ps, true).is_err() {
-                return (block, true); // protection unavailable: still valid memory
-            }
-            // Record it on the SEGMENT: the protection must be lifted before
-            // this memory can be recycled through an arena (the M8 P0).
-            (*segment_of(block)).guarded = true;
-            self.stats.guarded += 1;
-            // Right-align the object against the guard page.
-            let p = guard.sub(size.max(1));
-            let seg = segment_of(block);
-            let pg: *mut Page = &raw mut (*seg).pages[1];
-            (*pg).flags.fetch_or(pflags::HAS_ALIGNED, Ordering::Relaxed);
-            (p, true)
-        }
+        self.huge_alloc(need, ps, 0, Some(size.max(1)))
     }
 
     /// Out of line: `segment::huge_alloc` returns its `Result` through a stack
@@ -1187,8 +1193,14 @@ impl Heap {
     /// frame — a `sub`/`add` of the stack pointer on EVERY generic trip for
     /// an arm taken on requests above 32 MiB (callgrind, per instruction).
     #[inline(never)]
-    fn huge_alloc(&mut self, size: usize, align: usize, offset: usize) -> (*mut u8, bool) {
-        match segment::huge_alloc(size, align, offset, self.arena_id) {
+    fn huge_alloc(
+        &mut self,
+        size: usize,
+        align: usize,
+        offset: usize,
+        guarded_size: Option<usize>,
+    ) -> (*mut u8, bool) {
+        match segment::huge_alloc_with_guard(size, align, offset, self.arena_id, guarded_size) {
             Ok((seg, block)) => {
                 // SAFETY: fresh segment we own; page slot 1 is its block's
                 // metadata. DELAYED + xheap route remote frees through our
@@ -1203,6 +1215,7 @@ impl Heap {
                     page_set_flag(pg, XFLAG_DELAYED);
                     (*seg).next = self.huge_segments;
                     self.huge_segments = seg;
+                    self.stats.guarded += u64::from((*seg).guarded);
                 }
                 self.stat_alloc();
                 self.stats.huge_allocs += 1;
@@ -1215,7 +1228,10 @@ impl Heap {
                 // Found by P2 of docs/plans/small-metal.md.
                 self.stats.segments += 1;
                 // SAFETY: seg live; recycled arena chunks are NOT zero.
-                (block, unsafe { (*seg).mem_is_zero })
+                (
+                    block,
+                    guarded_size.is_some() || unsafe { (*seg).mem_is_zero },
+                )
             }
             Err(_) => (ptr::null_mut(), false),
         }
@@ -1398,13 +1414,13 @@ impl Heap {
         self.stats.generic += 1;
         // Huge sizes get exact placement in a dedicated segment.
         if size > LARGE_OBJ_SIZE_MAX {
-            return self.huge_alloc(size, align, offset);
+            return self.huge_alloc(size, align, offset, None);
         }
         // Oversize-and-adjust: allocate size + align - 1, hand out the first
         // interior position satisfying the constraint.
         let oversize = size.max(1) + align - 1;
         if oversize > LARGE_OBJ_SIZE_MAX {
-            return self.huge_alloc(size, align, offset);
+            return self.huge_alloc(size, align, offset, None);
         }
         let (block, is_zero) = self.malloc(oversize);
         if block.is_null() {
@@ -1594,7 +1610,7 @@ impl Heap {
                 // Bounded only as a stall guard; the list is normally short.
                 const MAX_RECLAIM: usize = 1024;
                 for _ in 0..MAX_RECLAIM {
-                    let aseg = crate::init::abandoned_pop();
+                    let aseg = self.pop_abandoned();
                     if aseg.is_null() {
                         break;
                     }
@@ -1676,10 +1692,14 @@ impl Heap {
     /// on aarch64-apple-darwin it faults immediately (19 of 20 stress runs).
     ///
     /// # Safety
+    /// A destroyable heap cannot adopt segments in debug mode because blocks
+    /// can still be queued on a different thread's quarantine.
     /// `seg` must be a Normal segment popped from the abandoned list, owned
     /// by nobody; calling thread becomes the owner.
     #[must_use = "returns false when the segment was released — using it then is a use-after-free"]
     pub unsafe fn adopt_segment(&mut self, seg: *mut Segment) -> bool {
+        #[cfg(feature = "debug_checks")]
+        assert!(!self.debug_destroyable);
         // SAFETY: we are the sole owner as of now; walking spans follows the
         // segment invariants (every span start is marked).
         unsafe {

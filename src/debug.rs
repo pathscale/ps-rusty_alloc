@@ -17,6 +17,7 @@
 //! call sites the way AddressSanitizer and heaptrack do.
 
 use core::fmt;
+use core::hash::Hasher;
 use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
 pub(crate) mod raw;
@@ -332,6 +333,10 @@ pub(crate) struct ThreadDebug {
     /// their headers, oldest first.
     q_head: core::cell::Cell<*mut u8>,
     q_tail: core::cell::Cell<*mut u8>,
+    /// Expected enqueue identity at the head. Zero when the queue is empty.
+    q_head_id: core::cell::Cell<usize>,
+    /// Last issued identity, retained after draining or detaching the queue.
+    q_last_id: core::cell::Cell<usize>,
     /// Bytes (requested sizes) in the quarantine.
     q_bytes: core::cell::Cell<usize>,
     /// Debug thread number, from 1; 0 until first needed.
@@ -353,6 +358,8 @@ impl ThreadDebug {
             seq: core::cell::Cell::new(0),
             q_head: core::cell::Cell::new(core::ptr::null_mut()),
             q_tail: core::cell::Cell::new(core::ptr::null_mut()),
+            q_head_id: core::cell::Cell::new(0),
+            q_last_id: core::cell::Cell::new(0),
             q_bytes: core::cell::Cell::new(0),
             tid: core::cell::Cell::new(0),
             stack_lo: core::cell::Cell::new(0),
@@ -371,34 +378,40 @@ fn thread_debug() -> Option<&'static ThreadDebug> {
     // `init::thread_done`) is checked and released directly. Creating a heap
     // during teardown would leave the exit hook pointing at a box that the
     // same teardown then releases.
-    let hb = crate::init::heap_box_fast();
-    if hb.is_null() || hb == crate::init::empty_heap_box_ptr() {
+    let hb = crate::init::debug_backing_heap();
+    if hb.is_null() {
         return None;
     }
-    // SAFETY: a live heap box of this thread; it is released only by this
-    // thread's teardown, after which `heap_box` no longer returns it. The
-    // reference is used transiently, never across that point.
+    // SAFETY: the backing box belongs to this thread and outlives default
+    // heap changes and first-class heap destruction.
     Some(unsafe { &(*hb).dbg })
 }
 
 static NEXT_TID: AtomicU32 = AtomicU32::new(0);
 
-/// The debug number of the thread owning `d`: 1, 2, ... in the order threads
-/// first need one.
+fn issue_thread_no(counter: &AtomicU32) -> u32 {
+    let mut last = counter.load(Ordering::Relaxed);
+    while let Some(next) = last.checked_add(1) {
+        match counter.compare_exchange_weak(last, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(current) => last = current,
+        }
+    }
+    0
+}
+
+/// The debug number of the thread owning `d`, or 0 if the numbers are exhausted.
 fn thread_no(d: &ThreadDebug) -> u32 {
     let t = d.tid.get();
     if t != 0 {
         return t;
     }
-    let t = NEXT_TID
-        .fetch_add(1, Ordering::Relaxed)
-        .wrapping_add(1)
-        .max(1);
+    let t = issue_thread_no(&NEXT_TID);
     d.tid.set(t);
     t
 }
 
-/// The calling thread's debug number (0 if it has no heap).
+/// The calling thread's debug number (0 if it has no heap or numbering is exhausted).
 pub fn thread_number() -> u32 {
     thread_debug().map_or(0, thread_no)
 }
@@ -473,9 +486,9 @@ const LIVE: u32 = 0x4c49_5645;
 const LIVE_RAW: u32 = 0x4c49_5652;
 const FREED: u32 = 0x4652_4545;
 
-/// The header. A live block is linked into its registry shard through
-/// `prev`/`next`; a freed one into its thread's quarantine through `next`,
-/// which is why a FREED header's checksum leaves the links out.
+/// A live block uses `prev` and `next` for the registry. In quarantine,
+/// `prev` holds the enqueue identity and `next` points to its successor.
+/// Both fields are authenticated in either state.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Header {
@@ -488,7 +501,10 @@ struct Header {
     alloc_tid: u32,
     free_tid: u32,
     state: u32,
-    align_log2: u16,
+    align_log2: u8,
+    /// A first-class heap can reclaim the block without consulting a
+    /// quarantine on another thread.
+    destroyable: u8,
     /// Registry shard epoch the block was linked in (see [`Shard`]).
     epoch: u16,
     check: u64,
@@ -508,36 +524,37 @@ impl Header {
             alloc_tid: tid,
             free_tid: 0,
             state: LIVE,
-            align_log2: align.trailing_zeros() as u16,
+            align_log2: align.trailing_zeros() as u8,
+            destroyable: 0,
             epoch: 0,
             check: 0,
         }
     }
 
     const fn align(&self) -> usize {
-        1usize << (self.align_log2 & 63)
+        1usize << self.align_log2
     }
 }
 
-/// Header checksum, keyed by the block address so a header copied or left
-/// behind at another address does not validate (Scudo's chunk checksum).
-fn checksum(user: usize, h: &Header) -> u64 {
-    let links = if h.state == FREED {
-        0
-    } else {
-        (h.prev.addr() as u64).rotate_left(17) ^ h.next.addr() as u64
-    };
-    let mut x = (user as u64) ^ 0x7275_7374_795f_6462;
-    x = (x ^ h.seq).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    x = (x ^ h.size).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    x = (x ^ ((u64::from(h.align_log2) << 48) | (u64::from(h.epoch) << 32) | u64::from(h.state)))
-        .wrapping_mul(0x94D0_49BB_1331_11EB);
-    x = (x ^ ((u64::from(h.alloc_stack) << 32) | u64::from(h.free_stack)))
-        .wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    x = (x ^ ((u64::from(h.alloc_tid) << 32) | u64::from(h.free_tid)))
-        .wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    x = (x ^ links).wrapping_mul(0x94D0_49BB_1331_11EB);
-    x ^ (x >> 31)
+// Each shard publishes its key under its existing lock. Key material lives in
+// the registry, outside the blocks that it authenticates.
+#[allow(deprecated, reason = "keyed, allocation-free SipHash-2-4 in core")]
+fn checksum(key: [u64; 2], user: usize, h: &Header) -> u64 {
+    let mut mac = core::hash::SipHasher::new_with_keys(key[0], key[1]);
+    mac.write_usize(user);
+    mac.write_usize(h.prev.addr());
+    mac.write_usize(h.next.addr());
+    mac.write_u64(h.seq);
+    mac.write_u64(h.size);
+    mac.write_u64(
+        (u64::from(h.destroyable) << 56)
+            | (u64::from(h.align_log2) << 48)
+            | (u64::from(h.epoch) << 32)
+            | u64::from(h.state),
+    );
+    mac.write_u64((u64::from(h.alloc_stack) << 32) | u64::from(h.free_stack));
+    mac.write_u64((u64::from(h.alloc_tid) << 32) | u64::from(h.free_tid));
+    mac.finish()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -548,11 +565,16 @@ enum State {
 }
 
 /// # Safety
-/// `user - HDR .. user` is readable.
-unsafe fn read_header(user: *mut u8) -> (State, Header) {
+/// `user - HDR .. user` is readable and the shard of `user` is locked.
+unsafe fn read_header(s: &Shard, user: *mut u8) -> (State, Header) {
     // SAFETY: per contract; unaligned-safe read.
     let h = unsafe { user.sub(HDR).cast::<Header>().read_unaligned() };
-    let ok = h.check == checksum(user.addr(), &h);
+    let ok = h.state == FREED || h.state == LIVE || h.state == LIVE_RAW;
+    let ok = ok
+        && u32::from(h.align_log2) < usize::BITS
+        && s.key
+            .get()
+            .is_some_and(|key| h.check == checksum(key, user.addr(), &h));
     let st = match h.state {
         LIVE | LIVE_RAW if ok => State::Live,
         FREED if ok => State::Freed,
@@ -564,29 +586,89 @@ unsafe fn read_header(user: *mut u8) -> (State, Header) {
 /// Write `h` with a fresh checksum.
 ///
 /// # Safety
-/// `user - HDR .. user` is writable and ours.
-unsafe fn write_header(user: *mut u8, mut h: Header) {
-    h.check = checksum(user.addr(), &h);
+/// `user - HDR .. user` is writable and ours, and its shard is locked.
+unsafe fn write_header(s: &Shard, user: *mut u8, mut h: Header) {
+    let key = s.key.get().expect("tracked shard key");
+    h.check = checksum(key, user.addr(), &h);
     // SAFETY: per contract.
     unsafe { user.sub(HDR).cast::<Header>().write_unaligned(h) };
 }
 
-/// Start of the core block holding `p`, from its page; `None` when `p` is not
-/// inside a carved page.
+/// Core block start and exclusive readable end. Huge segments retain both
+/// bounds after alignment or guard placement.
 ///
 /// # Safety
-/// `p` lies in a segment window this allocator owns.
-unsafe fn block_start(p: *mut u8) -> Option<*mut u8> {
+/// `p` lies in a live segment this allocator owns.
+unsafe fn block_extent(p: *mut u8) -> Option<(*mut u8, usize)> {
     // SAFETY: per contract the segment and its page table are ours.
     unsafe {
-        let pg = crate::segment::page_of(crate::segment::segment_of(p), p);
+        if !crate::segment_map::contains_segment_start(p) {
+            return None;
+        }
+        let seg = crate::segment::segment_of(p);
+        let delta = p.addr().checked_sub(seg.addr())?;
+        if delta >= (*seg).total_size || delta >= crate::types::SEGMENT_SIZE {
+            return None;
+        }
+        let slice = delta / crate::types::SEGMENT_SLICE_SIZE;
+        if slice == 0 {
+            return None;
+        }
+        if (*seg).kind == crate::segment::SegmentKind::Huge {
+            let start = (*seg).debug_huge_start;
+            let end = (*seg).debug_huge_end;
+            return (p.addr() >= start.addr() && p.addr() < end).then_some((start, end));
+        }
+        if (*seg).page_off[slice] == 0 {
+            return None;
+        }
+        let pg = crate::segment::page_of(seg, p);
         let bs = (*pg).block_size;
         let area = (*pg).area;
         if bs == 0 || area.is_null() || p.addr() < area.addr() {
             return None;
         }
-        Some(area.add((p.addr() - area.addr()) / bs * bs))
+        let index = (p.addr() - area.addr()) / bs;
+        if index >= (*pg).reserved as usize {
+            return None;
+        }
+        let start = area.add(index * bs);
+        Some((start, start.addr() + bs))
     }
+}
+
+#[cfg(all(
+    test,
+    feature = "std",
+    any(unix, windows),
+    not(miri),
+    not(ra_small_profile)
+))]
+#[test]
+fn metadata_aligned_huge_extent_rejects_continuation_window() {
+    use crate::{segment, segment_map, types::SEGMENT_SIZE};
+
+    let _arena = crate::arena::adopt_tests::lock();
+    let (seg, block) = segment::huge_alloc(SEGMENT_SIZE, SEGMENT_SIZE / 2, HDR, -1)
+        .expect("aligned huge allocation");
+    // SAFETY: the test owns the whole reservation, including its second window.
+    unsafe {
+        let continuation = seg.cast::<u8>().add(SEGMENT_SIZE);
+        assert!(segment_map::contains(continuation));
+        assert_eq!(block_extent(continuation), None);
+        assert_eq!(block_extent(seg.cast()), None);
+        assert_eq!(
+            block_extent(block),
+            Some((block, block.addr() + SEGMENT_SIZE))
+        );
+        segment::huge_free(seg).expect("release huge segment");
+    }
+}
+
+fn checked_size(p: *mut u8, end: usize, h: &Header) -> Option<usize> {
+    let size = usize::try_from(h.size).ok()?;
+    let capacity = end.checked_sub(p.addr())?.checked_sub(TRAILER)?;
+    (size <= capacity).then_some(size)
 }
 
 /// First byte in `p .. p + n` that is not `b`.
@@ -627,6 +709,7 @@ struct Shard {
     /// Holder of `lock` (`init::thread_id`), to catch re-entry.
     owner: core::sync::atomic::AtomicUsize,
     head: core::cell::Cell<*mut u8>,
+    key: core::cell::Cell<Option<[u64; 2]>>,
     count: core::cell::Cell<usize>,
     epoch: core::cell::Cell<u16>,
     /// Blocks dropped from the list by restarts.
@@ -642,6 +725,7 @@ impl Shard {
             lock: core::sync::atomic::AtomicBool::new(false),
             owner: core::sync::atomic::AtomicUsize::new(0),
             head: core::cell::Cell::new(core::ptr::null_mut()),
+            key: core::cell::Cell::new(None),
             count: core::cell::Cell::new(0),
             epoch: core::cell::Cell::new(0),
             lost: core::cell::Cell::new(0),
@@ -697,12 +781,12 @@ fn shard_of(user: *mut u8) -> &'static Shard {
 /// half-written.
 ///
 /// # Safety
-/// As [`read_header`].
+/// `user - HDR .. user` is readable.
 unsafe fn locked_read(user: *mut u8) -> (State, Header) {
     let s = shard_of(user);
     s.lock();
     // SAFETY: per contract.
-    let r = unsafe { read_header(user) };
+    let r = unsafe { read_header(s, user) };
     s.unlock();
     r
 }
@@ -718,7 +802,7 @@ unsafe fn relink(s: &Shard, nb: *mut u8, set_prev: bool, to: *mut u8) -> bool {
     }
     // SAFETY: per contract `nb` is a live block on this list.
     unsafe {
-        let (st, mut h) = read_header(nb);
+        let (st, mut h) = read_header(s, nb);
         if st != State::Live || h.epoch != s.epoch.get() {
             return false;
         }
@@ -727,7 +811,7 @@ unsafe fn relink(s: &Shard, nb: *mut u8, set_prev: bool, to: *mut u8) -> bool {
         } else {
             h.next = to;
         }
-        write_header(nb, h);
+        write_header(s, nb, h);
     }
     true
 }
@@ -739,6 +823,19 @@ unsafe fn relink(s: &Shard, nb: *mut u8, set_prev: bool, to: *mut u8) -> bool {
 unsafe fn track(user: *mut u8, mut h: Header) {
     let s = shard_of(user);
     s.lock();
+    if s.key.get().is_none() {
+        // Seed only on allocation and outside the registry lock. Reads and
+        // frees never call the platform entropy source.
+        s.unlock();
+        let mut rng = crate::random::Random::new();
+        rng.reseed();
+        let key =
+            core::array::from_fn(|_| u64::from(rng.next_u32()) | (u64::from(rng.next_u32()) << 32));
+        s.lock();
+        if s.key.get().is_none() {
+            s.key.set(Some(key));
+        }
+    }
     let head = s.head.get();
     // SAFETY: `head` is the list head, a live block of this list.
     let ok = unsafe { relink(s, head, true, user) };
@@ -749,13 +846,34 @@ unsafe fn track(user: *mut u8, mut h: Header) {
     h.next = s.head.get();
     h.epoch = s.epoch.get();
     // SAFETY: per contract.
-    unsafe { write_header(user, h) };
+    unsafe { write_header(s, user, h) };
     s.head.set(user);
     s.count.set(s.count.get() + 1);
     s.unlock();
     if !ok {
         report(&Violation::new(ViolationKind::CorruptHeader, head.addr()));
     }
+}
+
+/// Unlink the authenticated member of the locked shard. Returns the first
+/// neighbor that failed validation, after detaching the damaged list.
+unsafe fn unlink(s: &Shard, h: &Header) -> *mut u8 {
+    // SAFETY: h is a live member of the locked shard and its links authenticate.
+    let (ok_prev, ok_next) = unsafe {
+        let ok_prev = if h.prev.is_null() {
+            s.head.set(h.next);
+            true
+        } else {
+            relink(s, h.prev, false, h.next)
+        };
+        (ok_prev, relink(s, h.next, true, h.prev))
+    };
+    if !ok_prev || !ok_next {
+        s.restart();
+        return if ok_prev { h.next } else { h.prev };
+    }
+    s.count.set(s.count.get().saturating_sub(1));
+    core::ptr::null_mut()
 }
 
 /// Unlink a live block and write its FREED header `fh`, in one step under
@@ -771,28 +889,17 @@ unsafe fn untrack(user: *mut u8, seq: u64, fh: Header) -> Result<(), (State, Hea
     // SAFETY: per contract the block is ours; neighbors are reached only
     // through its validated links.
     let bad = unsafe {
-        let (st, h) = read_header(user);
+        let (st, h) = read_header(s, user);
         if st != State::Live || h.seq != seq {
             s.unlock();
             return Err((st, h));
         }
-        let mut bad = core::ptr::null_mut();
-        if h.epoch == s.epoch.get() {
-            let ok_prev = if h.prev.is_null() {
-                s.head.set(h.next);
-                true
-            } else {
-                relink(s, h.prev, false, h.next)
-            };
-            let ok_next = relink(s, h.next, true, h.prev);
-            if !ok_prev || !ok_next {
-                bad = if ok_prev { h.next } else { h.prev };
-                s.restart();
-            } else {
-                s.count.set(s.count.get().saturating_sub(1));
-            }
-        }
-        write_header(user, fh);
+        let bad = if h.epoch == s.epoch.get() {
+            unlink(s, &h)
+        } else {
+            core::ptr::null_mut()
+        };
+        write_header(s, user, fh);
         bad
     };
     s.unlock();
@@ -800,6 +907,46 @@ unsafe fn untrack(user: *mut u8, seq: u64, fh: Header) -> Result<(), (State, Hea
         report(&Violation::new(ViolationKind::CorruptHeader, bad.addr()));
     }
     Ok(())
+}
+
+/// Remove live debug headers before a first-class heap releases its segments.
+///
+/// # Safety
+/// The caller owns the heap and has excluded access to its blocks per
+/// `heap_destroy`'s contract.
+pub(crate) unsafe fn forget_heap(heap: &crate::heap::Heap) {
+    for s in &REGISTRY {
+        s.lock();
+        let mut cur = s.head.get();
+        while !cur.is_null() {
+            // SAFETY: current registry entries are live under their shard lock.
+            let (st, h) = unsafe { read_header(s, cur) };
+            if st != State::Live || h.epoch != s.epoch.get() {
+                // No authenticated path to the remaining entries.
+                s.restart();
+                break;
+            }
+            if h.destroyable != 0 {
+                let target = crate::segment::segment_of(cur);
+                let mut owned = false;
+                for mut seg in [heap.segments, heap.huge_segments] {
+                    while !seg.is_null() && seg != target {
+                        // SAFETY: only this thread owns these heap lists.
+                        seg = unsafe { (*seg).next };
+                    }
+                    owned |= seg == target;
+                }
+                if owned {
+                    // SAFETY: h is an authenticated member of the locked shard.
+                    if !unsafe { unlink(s, &h) }.is_null() {
+                        break;
+                    }
+                }
+            }
+            cur = h.next;
+        }
+        s.unlock();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -862,18 +1009,30 @@ unsafe fn alloc_block(
     let Some(total) = size.checked_add(HDR + TRAILER + 15) else {
         return core::ptr::null_mut();
     };
-    // SAFETY: per contract.
-    let base = unsafe {
-        if align <= 16 && offset == 0 {
-            // A 16-multiple request lands in a 16-aligned bin, so the user
-            // pointer (`base + HDR`, HDR a multiple of 16) is 16-aligned too.
-            crate::alloc::core_alloc(hb, total & !15, 16, 0)
-        } else {
-            let Some(at) = offset.checked_add(HDR) else {
-                return core::ptr::null_mut();
-            };
-            crate::alloc::core_alloc(hb, total - 15, align, at)
-        }
+    let (core_size, core_align, core_offset) = if align <= 16 && offset == 0 {
+        // A 16-multiple request lands in a 16-aligned bin, so the user
+        // pointer (`base + HDR`, HDR a multiple of 16) is 16-aligned too.
+        (total & !15, 16, 0)
+    } else {
+        let Some(at) = offset.checked_add(HDR) else {
+            return core::ptr::null_mut();
+        };
+        (total - 15, align, at)
+    };
+    let hb = if hb.is_null() {
+        crate::init::heap_box()
+    } else {
+        hb
+    };
+    if hb.is_null() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: hb is this thread's live heap, whether passed or resolved here.
+    let (base, destroyable) = unsafe {
+        (
+            crate::alloc::core_alloc(hb, core_size, core_align, core_offset),
+            u8::from((*hb).allow_destroy),
+        )
     };
     if base.is_null() {
         return base;
@@ -897,6 +1056,7 @@ unsafe fn alloc_block(
             (s, thread_no(d))
         });
         let mut h = Header::live(seq, size, align, st, tid);
+        h.destroyable = destroyable;
         if raw {
             h.state = LIVE_RAW;
         }
@@ -932,7 +1092,7 @@ unsafe fn inspect(v: &mut Violation) -> Inspect {
     }
     // SAFETY: `p` is in a window we own; reads stay inside its core block.
     unsafe {
-        let Some(start) = block_start(p) else {
+        let Some((start, end)) = block_extent(p) else {
             v.kind = ViolationKind::ForeignPointer;
             report(v);
             return Inspect::Rejected;
@@ -976,10 +1136,15 @@ unsafe fn inspect(v: &mut Violation) -> Inspect {
                 return Inspect::Rejected;
             }
         }
+        let Some(size) = checked_size(p, end, &h) else {
+            v.kind = ViolationKind::CorruptHeader;
+            report(v);
+            return Inspect::Rejected;
+        };
         v.block(&h);
-        if let Some(i) = first_not(p.add(h.size as usize), CANARY_BYTE, TRAILER) {
+        if let Some(i) = first_not(p.add(size), CANARY_BYTE, TRAILER) {
             v.kind = ViolationKind::BufferOverflow;
-            v.offset = h.size as usize + i;
+            v.offset = size + i;
             report(v);
         }
         Inspect::Block(h)
@@ -1073,7 +1238,11 @@ pub fn quarantine_limit() -> usize {
 unsafe fn core_free(p: *mut u8) {
     // SAFETY: per contract; the core block start frees the whole block, also
     // when the block was placed at an offset for its alignment.
-    unsafe { crate::alloc::free(block_start(p).unwrap_or_else(|| p.sub(HDR))) };
+    unsafe {
+        if let Some((start, _)) = block_extent(p) {
+            crate::alloc::free(start);
+        }
+    }
 }
 
 /// Hand a validated block back: unlink it, record where it was freed,
@@ -1115,34 +1284,87 @@ unsafe fn release(p: *mut u8, h: Header, st: StackId) {
             count(d, |c| c.on_free(size));
         }
         let limit = quarantine_limit();
-        let Some(d) = d.filter(|_| size <= limit) else {
+        // Destroyable heaps can reclaim their segments without access to
+        // another thread's queue. Unnumbered queues cannot identify an owner.
+        let Some(d) = d.filter(|_| h.destroyable == 0 && fh.free_tid != 0 && size <= limit) else {
             core_free(p);
             return;
         };
+        // Assign consecutive identities at enqueue time, after any reporting
+        // in untrack. A reentrant free can have appended in the meantime.
+        let Some(id) = d.q_last_id.get().checked_add(1) else {
+            core_free(p);
+            return;
+        };
+        fh.prev = core::ptr::without_provenance_mut(id);
+        let shard = shard_of(p);
+        shard.lock();
+        write_header(shard, p, fh);
+        shard.unlock();
         let tail = d.q_tail.get();
-        if tail.is_null() {
+        let bad_tail = !tail.is_null() && !link_q_tail(d, tail, p);
+        if bad_tail {
+            clear_quarantine(d);
+        }
+        if d.q_head.get().is_null() {
             d.q_head.set(p);
-        } else {
-            set_q_next(tail, p);
+            d.q_head_id.set(id);
         }
         d.q_tail.set(p);
+        d.q_last_id.set(id);
         d.q_bytes.set(d.q_bytes.get() + size);
+        if bad_tail {
+            report(&Violation::new(ViolationKind::CorruptHeader, tail.addr()));
+        }
         while d.q_bytes.get() > limit && evict_one(d) {}
     }
 }
 
-/// Set the quarantine link of a FREED block (outside its checksum).
+fn clear_quarantine(d: &ThreadDebug) {
+    d.q_head.set(core::ptr::null_mut());
+    d.q_tail.set(core::ptr::null_mut());
+    d.q_head_id.set(0);
+    d.q_bytes.set(0);
+}
+
+/// Validate the segment header window and core extent before reading a
+/// quarantine header.
 ///
 /// # Safety
-/// `p` is a FREED block in the calling thread's quarantine.
-unsafe fn set_q_next(p: *mut u8, next: *mut u8) {
-    // SAFETY: per contract; the field lies inside the header.
-    unsafe {
-        p.sub(HDR)
-            .add(core::mem::offset_of!(Header, next))
-            .cast::<*mut u8>()
-            .write_unaligned(next);
+/// The queue owns `p` and retains its core allocation.
+unsafe fn quarantine_end(p: *mut u8) -> Option<usize> {
+    // SAFETY: the queue retains the allocation. block_extent checks that
+    // the resolved segment has a header before accessing it.
+    let (start, end) = unsafe { block_extent(p) }?;
+    (p.addr().checked_sub(start.addr())? >= HDR).then_some(end)
+}
+
+/// Append to a verified terminal header. The shard lock also serializes this
+/// rewrite against a cross-thread diagnostic reading the freed header.
+///
+/// # Safety
+/// `tail` is the stored tail of this thread's quarantine and still allocated.
+unsafe fn link_q_tail(d: &ThreadDebug, tail: *mut u8, next: *mut u8) -> bool {
+    // SAFETY: per contract, the queue owns the stored tail.
+    let Some(end) = (unsafe { quarantine_end(tail) }) else {
+        return false;
+    };
+    let s = shard_of(tail);
+    s.lock();
+    // SAFETY: the queue still owns the tail and its shard is locked.
+    let (st, mut h) = unsafe { read_header(s, tail) };
+    let ok = st == State::Freed
+        && h.free_tid == d.tid.get()
+        && h.prev.addr() == d.q_last_id.get()
+        && h.next.is_null()
+        && checked_size(tail, end, &h).is_some_and(|size| size <= d.q_bytes.get());
+    if ok {
+        h.next = next;
+        // SAFETY: same allocation and lock as above.
+        unsafe { write_header(s, tail, h) };
     }
+    s.unlock();
+    ok
 }
 
 /// Release the oldest quarantined block after checking its poison and
@@ -1155,23 +1377,40 @@ fn evict_one(d: &ThreadDebug) -> bool {
     // SAFETY: quarantined blocks are ours and stay allocated in the core
     // until this call frees them.
     unsafe {
-        let (st, h) = read_header(p);
-        if st != State::Freed {
-            // The header (and with it the link) was overwritten: report and
-            // abandon the rest of the queue rather than follow a bad link.
-            let v = Violation::new(ViolationKind::CorruptHeader, p.addr());
-            d.q_head.set(core::ptr::null_mut());
-            d.q_tail.set(core::ptr::null_mut());
-            d.q_bytes.set(0);
-            report(&v);
+        let id = d.q_head_id.get();
+        let last = d.q_last_id.get();
+        let bytes = d.q_bytes.get();
+        let entry = quarantine_end(p).and_then(|end| {
+            let (st, h) = locked_read(p);
+            let size = checked_size(p, end, &h)?;
+            let terminal = p == d.q_tail.get();
+            let budget_ok = if terminal {
+                id == last && size == bytes
+            } else {
+                id < last && size <= bytes
+            };
+            (st == State::Freed
+                && h.free_tid == d.tid.get()
+                && h.prev.addr() == id
+                && h.next != p
+                && h.next.is_null() == terminal
+                && budget_ok)
+                .then_some((h, size))
+        });
+        let Some((h, size)) = entry else {
+            // A damaged queue cannot be walked safely.
+            clear_quarantine(d);
+            report(&Violation::new(ViolationKind::CorruptHeader, p.addr()));
             return true;
-        }
-        let size = h.size as usize;
-        d.q_head.set(h.next);
+        };
         if h.next.is_null() {
-            d.q_tail.set(core::ptr::null_mut());
+            clear_quarantine(d);
+        } else {
+            // The authenticated link is to the next consecutive enqueue.
+            d.q_head.set(h.next);
+            d.q_head_id.set(id + 1);
+            d.q_bytes.set(bytes - size);
         }
-        d.q_bytes.set(d.q_bytes.get().saturating_sub(size));
         let hit = first_not(p, FREED_BYTE, size)
             .or_else(|| first_not(p.add(size), CANARY_BYTE, TRAILER).map(|i| size + i));
         if let Some(off) = hit {
@@ -1312,7 +1551,7 @@ pub fn leak_report(f: &mut dyn FnMut(&Leak)) -> LeakSummary {
         while !cur.is_null() {
             // SAFETY: `cur` is the head or came from a validated link of
             // this list, under its lock: a live, allocated block.
-            let (st, h) = unsafe { read_header(cur) };
+            let (st, h) = unsafe { read_header(s, cur) };
             if st != State::Live || h.epoch != ep {
                 break;
             }
@@ -1648,12 +1887,9 @@ pub(crate) enum Chunk {
 /// Count a chunk event on the calling thread, if it has a heap (the chunk
 /// paths run under the heap; a thread without one is not counted).
 pub(crate) fn count_chunk(k: Chunk) {
-    let hb = crate::init::heap_box_fast();
-    if hb.is_null() || hb == crate::init::empty_heap_box_ptr() {
+    let Some(d) = thread_debug() else {
         return;
-    }
-    // SAFETY: the calling thread's live heap box.
-    let d = unsafe { &(*hb).dbg };
+    };
     count(d, |c| match k {
         Chunk::ArenaClaim => c.arena_claims += 1,
         Chunk::OsReserve => c.os_reserves += 1,
@@ -1832,4 +2068,276 @@ pub fn print_stats() {
         f.quarantine_bytes,
         f.parked_chunks
     ));
+}
+
+#[cfg(all(test, feature = "std", any(unix, windows), not(miri)))]
+#[test]
+fn metadata_rejects_oversized_live_header_and_corrupt_quarantine_link() {
+    use crate::alloc::{free, malloc, realloc, usable_size};
+
+    static REPORTS: AtomicU32 = AtomicU32::new(0);
+    let _arena = crate::arena::adopt_tests::lock();
+    let old_limit = QUARANTINE_LIMIT.swap(256, Ordering::Relaxed);
+    let p = malloc(64);
+    assert!(!p.is_null());
+    let previous_handler = set_handler(Some(|v| {
+        assert_eq!(v.kind, ViolationKind::CorruptHeader);
+        REPORTS.fetch_add(1, Ordering::Relaxed);
+    }));
+    // SAFETY: the test owns this allocation and its metadata. After free it
+    // stays mapped in this thread's quarantine until eviction.
+    unsafe {
+        assert_eq!(usable_size(p), 64);
+        let (_, end) = block_extent(p).expect("live block extent");
+        let shard = shard_of(p);
+        shard.lock();
+        let (_, original) = read_header(shard, p);
+        let mut forged = original;
+        // Sign a size one byte past the extent to exercise the size check
+        // independently of authentication.
+        forged.size = (end - p.addr() - TRAILER + 1) as u64;
+        write_header(shard, p, forged);
+        shard.unlock();
+        assert!(realloc(p, 128).is_null());
+        assert_eq!(REPORTS.load(Ordering::Relaxed), 1);
+
+        shard.lock();
+        write_header(shard, p, original);
+        shard.unlock();
+        let successor = malloc(64);
+        let tail = malloc(64);
+        assert!(!successor.is_null() && !tail.is_null());
+        free(p);
+        free(successor);
+        let d = thread_debug().expect("own quarantine");
+        assert_eq!(d.q_head.get(), p);
+        assert_eq!(d.q_tail.get(), successor);
+        let header = p.sub(HDR).cast::<Header>();
+        let next = &raw mut (*header).next;
+        // A non-null, non-self replacement has the expected link shape.
+        next.write_unaligned(core::ptr::without_provenance_mut(1));
+        assert!(evict_one(d));
+        assert_eq!(REPORTS.load(Ordering::Relaxed), 2);
+        assert!(d.q_head.get().is_null() && d.q_tail.get().is_null());
+        assert_eq!(d.q_bytes.get(), 0);
+        // Eviction detached the queue without releasing either block.
+        core_free(p);
+        core_free(successor);
+
+        let appended = malloc(64);
+        assert!(!appended.is_null());
+        free(tail);
+        let header = tail.sub(HDR).cast::<Header>();
+        let next = &raw mut (*header).next;
+        next.write_unaligned(core::ptr::without_provenance_mut(1));
+        free(appended);
+        assert_eq!(REPORTS.load(Ordering::Relaxed), 3);
+        assert_eq!(d.q_head.get(), appended);
+        flush_quarantine();
+        assert_eq!(REPORTS.load(Ordering::Relaxed), 3);
+        core_free(tail);
+    }
+    let _ = set_handler(previous_handler);
+    QUARANTINE_LIMIT.store(old_limit, Ordering::Relaxed);
+}
+
+#[cfg(all(test, feature = "std", any(unix, windows), not(miri)))]
+#[test]
+fn metadata_rejects_stale_quarantine_enqueue_identity() {
+    use crate::alloc::{free, malloc};
+
+    static REPORTS: AtomicU32 = AtomicU32::new(0);
+    let _arena = crate::arena::adopt_tests::lock();
+    flush_quarantine();
+    let old_limit = QUARANTINE_LIMIT.swap(256, Ordering::Relaxed);
+    let p = malloc(64);
+    let q = malloc(64);
+    let r = malloc(64);
+    assert!(!p.is_null() && !q.is_null() && !r.is_null());
+    let previous_handler = set_handler(Some(|v| {
+        assert_eq!(v.kind, ViolationKind::CorruptHeader);
+        REPORTS.fetch_add(1, Ordering::Relaxed);
+    }));
+    let d = thread_debug().expect("own quarantine");
+    // SAFETY: the test exclusively owns these allocations. Detaching the
+    // queue leaves its core allocations mapped so reuse is deterministic.
+    unsafe {
+        let (_, live_p) = locked_read(p);
+        let (_, live_q) = locked_read(q);
+        free(p);
+        let (_, old_tail) = locked_read(p);
+        free(q);
+        let (_, old_head) = locked_read(p);
+        assert_eq!(old_head.next, q);
+        assert!(old_tail.next.is_null());
+
+        clear_quarantine(d);
+        track(p, live_p);
+        track(q, live_q);
+        free(p);
+        free(r);
+        free(q);
+        assert_eq!(d.q_head.get(), p);
+        assert_eq!(d.q_tail.get(), q);
+        assert_eq!(locked_read(p).1.next, r);
+
+        let header = p.sub(HDR).cast::<Header>();
+        header.write_unaligned(old_head);
+        assert!(locked_read(p).0 == State::Freed);
+        assert!(evict_one(d));
+        assert_eq!(REPORTS.load(Ordering::Relaxed), 1);
+        assert!(d.q_head.get().is_null() && d.q_tail.get().is_null());
+        assert_eq!(d.q_bytes.get(), 0);
+        core_free(q);
+        core_free(r);
+
+        let fresh = malloc(64);
+        let fresh_tail = malloc(64);
+        assert!(!fresh.is_null() && !fresh_tail.is_null());
+        track(p, live_p);
+        free(p);
+        assert_eq!(d.q_tail.get(), p);
+        header.write_unaligned(old_tail);
+        assert!(locked_read(p).0 == State::Freed);
+        free(fresh);
+        assert_eq!(REPORTS.load(Ordering::Relaxed), 2);
+        assert_eq!(d.q_head.get(), fresh);
+        assert_eq!(d.q_tail.get(), fresh);
+        free(fresh_tail);
+        assert!(evict_one(d));
+        assert_eq!(d.q_head.get(), fresh_tail);
+        assert_eq!(d.q_bytes.get(), 64);
+        flush_quarantine();
+        assert_eq!(REPORTS.load(Ordering::Relaxed), 2);
+        assert!(d.q_head.get().is_null() && d.q_tail.get().is_null());
+        assert_eq!(d.q_bytes.get(), 0);
+        core_free(p);
+    }
+    let _ = set_handler(previous_handler);
+    QUARANTINE_LIMIT.store(old_limit, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+#[test]
+fn metadata_quarantine_owner_number_is_not_reused_at_exhaustion() {
+    let counter = AtomicU32::new(u32::MAX - 1);
+    assert_eq!(issue_thread_no(&counter), u32::MAX);
+    assert_eq!(issue_thread_no(&counter), 0);
+    assert_eq!(issue_thread_no(&counter), 0);
+}
+
+#[cfg(all(test, feature = "std", any(unix, windows), not(miri)))]
+#[test]
+fn metadata_guarded_extent_stops_before_the_guard_page() {
+    use crate::alloc::{expand, free, heap_malloc, usable_size};
+
+    static REPORTS: AtomicU32 = AtomicU32::new(0);
+    let _arena = crate::arena::adopt_tests::lock();
+    let hb = crate::init::create_heap(0, true, -1);
+    assert!(!hb.is_null());
+    // SAFETY: this thread owns the heap and all the blocks it creates here.
+    unsafe {
+        let heap = (*hb).heap.get();
+        (*heap).guarded_set_size_bound(1, 4096);
+        (*heap).guarded_set_sample_rate(1, 0);
+        let p = heap_malloc(hb, 64);
+        assert!(!p.is_null());
+        assert_eq!((*heap).stats.guarded, 1);
+        assert_eq!(usable_size(p), 64);
+        let (_, end) = block_extent(p).expect("guarded block extent");
+        let guard = crate::os::page_align_up(p.addr() + 64 + TRAILER);
+        assert_eq!(end, guard);
+
+        let previous_handler = set_handler(Some(|v| {
+            assert_eq!(v.kind, ViolationKind::CorruptHeader);
+            REPORTS.fetch_add(1, Ordering::Relaxed);
+        }));
+        let s = shard_of(p);
+        s.lock();
+        let (_, original) = read_header(s, p);
+        let mut forged = original;
+        forged.size = (end - p.addr() - TRAILER + 1) as u64;
+        write_header(s, p, forged);
+        s.unlock();
+        assert_eq!(usable_size(p), 0);
+        assert!(expand(p, 64).is_null());
+        assert_eq!(REPORTS.load(Ordering::Relaxed), 2);
+
+        s.lock();
+        write_header(s, p, original);
+        s.unlock();
+        free(p);
+        flush_quarantine();
+        let _ = set_handler(previous_handler);
+        crate::init::heap_destroy(hb);
+    }
+}
+
+#[cfg(all(test, feature = "std", any(unix, windows), not(miri)))]
+#[test]
+fn metadata_heap_destroy_preserves_quarantine_and_orphan_lifetimes() {
+    use crate::alloc::{free, heap_collect, heap_malloc, malloc, usable_size};
+    use crate::init::{create_heap, heap_destroy, set_default_heap};
+    use std::{sync::mpsc, thread};
+
+    let _arena = crate::arena::adopt_tests::lock();
+    let old_limit = QUARANTINE_LIMIT.swap(256, Ordering::Relaxed);
+    let pending = malloc(64);
+    let survivor = malloc(64);
+    assert!(!pending.is_null() && !survivor.is_null());
+
+    let orphan = thread::spawn(|| malloc(64).expose_provenance())
+        .join()
+        .unwrap();
+    assert_ne!(orphan, 0);
+    let hb = create_heap(0, true, -1);
+    assert!(!hb.is_null());
+    // SAFETY: hb is our heap, and pending is still a live backing allocation.
+    let (live, remote) = unsafe {
+        set_default_heap(hb);
+        heap_collect(hb, true);
+        let live = malloc(64);
+        let remote = heap_malloc(hb, 64);
+        assert!(!live.is_null() && !remote.is_null());
+        free(pending);
+        (live.addr(), remote.expose_provenance())
+    };
+
+    let (freed_tx, freed_rx) = mpsc::channel();
+    let (destroyed_tx, destroyed_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let prime = malloc(64);
+        assert!(!prime.is_null());
+        // SAFETY: the worker owns prime and received remote for one free.
+        unsafe {
+            free(prime);
+            free(core::ptr::with_exposed_provenance_mut(remote));
+        }
+        freed_tx.send(()).unwrap();
+        destroyed_rx.recv().unwrap();
+        flush_quarantine();
+    });
+    freed_rx.recv().unwrap();
+    // SAFETY: no caller can access allocations in hb after this call.
+    unsafe { heap_destroy(hb) };
+    destroyed_tx.send(()).unwrap();
+    worker.join().unwrap();
+
+    let mut seen_survivor = false;
+    leak_report(&mut |entry| {
+        assert_ne!(entry.ptr, live);
+        seen_survivor |= entry.ptr == survivor.addr();
+    });
+    assert!(seen_survivor);
+    assert_eq!(thread_debug().unwrap().q_head.get(), pending);
+    let orphan = core::ptr::with_exposed_provenance_mut(orphan);
+    // SAFETY: the orphan and survivor were allocated outside the destroyed
+    // heap and both remain owned by the test.
+    unsafe {
+        assert_eq!(usable_size(orphan), 64);
+        free(orphan);
+        free(survivor);
+    }
+    flush_quarantine();
+    QUARANTINE_LIMIT.store(old_limit, Ordering::Relaxed);
 }

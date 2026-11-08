@@ -366,7 +366,11 @@ mod heap_tls {
         #[cfg(all(not(feature = "std"), unix, not(ra_single_threaded)))]
         {
             let hb = HEAP_PTR.get();
-            if hb.is_null() { super::empty_heap_box_ptr() } else { hb }
+            if hb.is_null() {
+                super::empty_heap_box_ptr()
+            } else {
+                hb
+            }
         }
         #[cfg(not(all(not(feature = "std"), unix, not(ra_single_threaded))))]
         {
@@ -680,6 +684,10 @@ fn create_heap_uninstalled(tag: i32, allow_destroy: bool, arena_id: i32) -> *mut
         (*(*hb).heap.get()).delayed = &raw const (*hb).delayed;
         (*(*hb).heap.get()).arena_id = arena_id;
         (*(*hb).heap.get()).tag = tag;
+        #[cfg(feature = "debug_checks")]
+        {
+            (*(*hb).heap.get()).debug_destroyable = allow_destroy;
+        }
         // Per-heap CSPRNG stream (free-list keys, guarded sampling) -- seeded
         // only where something draws from it. A build with neither `secure`
         // nor guard pages has no consumer, and seeding still cost the ChaCha
@@ -729,6 +737,12 @@ ra_thread_local! {
     /// The thread's original (backing) heap — what `mi_heap_get_backing`
     /// returns regardless of `mi_heap_set_default` swaps.
     static BACKING_PTR: Cell<*mut HeapBox> = const { Cell::new(ptr::null_mut()) };
+}
+
+/// Debug state belongs to the backing heap, even when the default changes.
+#[cfg(feature = "debug_checks")]
+pub(crate) fn debug_backing_heap() -> *mut HeapBox {
+    BACKING_PTR.with(|c| c.get())
 }
 
 /// `mi_heap_get_backing`.
@@ -820,6 +834,8 @@ pub unsafe fn thread_done(hb: *mut HeapBox) {
     unsafe {
         crate::debug::thread_done(hb);
     }
+    #[cfg(feature = "debug_checks")]
+    BACKING_PTR.with(|c| c.set(ptr::null_mut()));
     // SAFETY: per contract we are the owner and this runs exactly once;
     // sequencing per the model.
     unsafe { thread_done_one(hb) };
@@ -1012,6 +1028,8 @@ pub unsafe fn heap_destroy(hb: *mut HeapBox) {
         }
         ra_debug_assert_eq!((*hb).owner_tid, thread_id());
         let h = &mut *(*hb).heap.get();
+        #[cfg(feature = "debug_checks")]
+        crate::debug::forget_heap(h);
         // Spin out any in-flight FREEING remotes before the box dies; blocks
         // they queued are dying with the heap, so the delayed list is simply
         // discarded.

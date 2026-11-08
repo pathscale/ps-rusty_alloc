@@ -54,6 +54,15 @@ const WORD_BITS: usize = u32::BITS as usize;
 #[cfg(all(not(ra_small_profile), not(all(target_arch = "wasm32", not(miri)))))]
 static MAP: [AtomicU32; MAP_WORDS] = [const { AtomicU32::new(0) }; MAP_WORDS];
 
+// The ownership map also covers huge continuation windows, which have
+// no segment header. Track header windows separately for debug probes.
+#[cfg(all(
+    feature = "debug_checks",
+    not(ra_small_profile),
+    not(all(target_arch = "wasm32", not(miri)))
+))]
+static HEADER_MAP: [AtomicU32; MAP_WORDS] = [const { AtomicU32::new(0) }; MAP_WORDS];
+
 /// Small profile: an EXACT range table instead of a window bitmap.
 ///
 /// The bitmap's size is a function of the ADDRESS SPACE, not of the memory
@@ -177,12 +186,21 @@ mod range_table {
     /// register/unregister can flip the answer, which is the same best-effort
     /// the bitmap gives.
     pub(super) fn contains(addr: usize) -> bool {
+        contains_matching(|base, end| addr >= base && addr < end)
+    }
+
+    #[cfg(feature = "debug_checks")]
+    pub(super) fn contains_start(addr: usize) -> bool {
+        contains_matching(|base, _| addr == base)
+    }
+
+    fn contains_matching(matches: impl Fn(usize, usize) -> bool) -> bool {
         if OVERFLOWED.load(Ordering::Acquire) {
             return true;
         }
         (0..MAX_RANGES).any(|i| {
             let e = END[i].load(Ordering::Acquire);
-            e != 0 && addr >= BASE[i].load(Ordering::Relaxed) && addr < e
+            e != 0 && matches(BASE[i].load(Ordering::Relaxed), e)
         })
     }
 }
@@ -317,6 +335,10 @@ pub fn register_range(base: usize, size: usize) {
         walk_windows(base, size, |w, bit| {
             MAP[w].fetch_or(bit, Ordering::Release);
         });
+        #[cfg(feature = "debug_checks")]
+        if let Some((w, bit)) = locate(base) {
+            HEADER_MAP[w].fetch_or(bit, Ordering::Release);
+        }
     }
 }
 
@@ -343,6 +365,10 @@ pub fn unregister_range(base: usize, size: usize) {
         walk_windows(base, size, |w, bit| {
             MAP[w].fetch_and(!bit, Ordering::Release);
         });
+        #[cfg(feature = "debug_checks")]
+        if let Some((w, bit)) = locate(base) {
+            HEADER_MAP[w].fetch_and(!bit, Ordering::Release);
+        }
     }
 }
 
@@ -367,6 +393,27 @@ pub fn contains(p: *const u8) -> bool {
             Some((w, bit)) => MAP[w].load(Ordering::Acquire) & bit != 0,
             None => false,
         }
+    }
+}
+
+/// Does the segment resolved from `p` have a registered header?
+#[cfg(feature = "debug_checks")]
+pub(crate) fn contains_segment_start(p: *const u8) -> bool {
+    if crate::ONE_REGION {
+        return crate::prim::fixed::region_contains(p.addr());
+    }
+    #[cfg(all(target_arch = "wasm32", not(miri)))]
+    {
+        base_of(p.addr()) != 0
+    }
+    #[cfg(all(ra_small_profile, not(all(target_arch = "wasm32", not(miri)))))]
+    {
+        let base = crate::segment::segment_of(p.cast_mut()).addr();
+        range_table::contains_start(base)
+    }
+    #[cfg(all(not(ra_small_profile), not(all(target_arch = "wasm32", not(miri)))))]
+    {
+        locate(p.addr()).is_some_and(|(w, bit)| HEADER_MAP[w].load(Ordering::Acquire) & bit != 0)
     }
 }
 

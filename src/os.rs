@@ -216,7 +216,7 @@ pub(crate) mod test_hooks {
     pub const INJECTED: super::PrimError = 0xFA11;
 
     std::thread_local! {
-        static FAIL_COMMITS: Cell<usize> = const { Cell::new(0) };
+        static FAIL_COMMITS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
         static FAIL_PURGES: Cell<usize> = const { Cell::new(0) };
     }
 
@@ -237,14 +237,23 @@ pub(crate) mod test_hooks {
 
     /// Fail this thread's next `n` commits.
     pub fn fail_next_commits(n: usize) {
-        FAIL_COMMITS.with(|c| c.set(n));
+        fail_commits_after(0, n);
+    }
+
+    /// Allow `skip` commits before failing the following `n` on this thread.
+    pub fn fail_commits_after(skip: usize, n: usize) {
+        FAIL_COMMITS.with(|c| c.set((skip, n)));
     }
 
     pub(super) fn take_commit_failure() -> bool {
         FAIL_COMMITS.with(|c| {
-            let n = c.get();
+            let (skip, n) = c.get();
+            if skip > 0 {
+                c.set((skip - 1, n));
+                return false;
+            }
             if n > 0 {
-                c.set(n - 1);
+                c.set((0, n - 1));
             }
             n > 0
         })

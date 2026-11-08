@@ -128,8 +128,19 @@ unsafe fn settle_claimed(a: *mut Arena, start: usize, n: usize) -> Result<(), us
             }
             if os::commit((*a).base.add(j * SEGMENT_SIZE), SEGMENT_SIZE).is_err() {
                 crate::stats::commit_failed();
-                for k in start..start + n {
-                    (*a).used[k / WORD_BITS].fetch_and(!(1 << (k % WORD_BITS)), Ordering::AcqRel);
+                // Metadata is settled before any chunk becomes claimable:
+                // successful commits cleared their bits, the failed one kept
+                // its bit, and parked accounting is intact. Release only our
+                // bits, once per word. MULTI_LOCK excludes other multi-chunk
+                // claims across words while single claims can reuse each word.
+                let end = start + n;
+                let mut k = start;
+                while k < end {
+                    let lo = k % WORD_BITS;
+                    let len = (end - k).min(WORD_BITS - lo);
+                    let mask = (BitWord::MAX >> (WORD_BITS - len)) << lo;
+                    (*a).used[k / WORD_BITS].fetch_and(!mask, Ordering::AcqRel);
+                    k += len;
                 }
                 return Err(j);
             }
@@ -942,6 +953,104 @@ pub(crate) mod adopt_tests {
     fn free_all(held: &[(*mut u8, bool)]) {
         for &(p, _) in held {
             assert!(chunk_free(p), "drained chunk did not free back");
+        }
+    }
+
+    #[cfg(all(feature = "std", any(unix, windows), not(miri)))]
+    #[test]
+    fn failed_arena_recommit_releases_every_claim() {
+        use crate::os::test_hooks::{fail_commits_after, fail_next_commits};
+
+        for (start, n) in [(1, 1), (1, 3), (WORD_BITS - 1, 3)] {
+            let end = start + n;
+            let chunks = end + n;
+            let size = chunks * SEGMENT_SIZE;
+            let block = os::alloc_aligned(size, SEGMENT_SIZE, false, false)
+                .expect("reserve arena address space");
+            let id = arena_register(block.ptr, size, true, true, -1, true)
+                .expect("register an exclusive test arena");
+            let a = ARENAS[id as usize].load(Ordering::Acquire);
+
+            // SAFETY: the exclusive arena ID is private to this test. Claim all
+            // chunks so we can return just the runs needed for each attempt.
+            let (p, failed, alternate) = unsafe {
+                for j in 0..chunks {
+                    (*a).used[j / WORD_BITS].fetch_or(1 << (j % WORD_BITS), Ordering::Relaxed);
+                }
+                (
+                    block.ptr.add(start * SEGMENT_SIZE),
+                    block.ptr.add((end - 1) * SEGMENT_SIZE),
+                    block.ptr.add(end * SEGMENT_SIZE),
+                )
+            };
+            for j in start..end {
+                // SAFETY: the test owns this chunk in the live reservation.
+                let chunk = unsafe { block.ptr.add(j * SEGMENT_SIZE) };
+                let state = if n > 1 && j == start {
+                    // SAFETY: the chunk is held and lies inside the reservation.
+                    unsafe { os::commit(chunk, SEGMENT_SIZE) }.expect("back the parked chunk");
+                    PARKED_RESIDENT.fetch_add(1, Ordering::Relaxed);
+                    ChunkState::Parked
+                } else {
+                    ChunkState::Decommitted
+                };
+                assert!(chunk_free_state(chunk, state));
+            }
+
+            // A multi-chunk claim recommits its middle chunk before failing
+            // on the final one. Neither path may publish a partial claim.
+            fail_commits_after((n > 1) as usize, 1);
+            let got = chunk_alloc_n(id, n);
+            fail_next_commits(0);
+            assert!(got.is_none(), "published failed run {start}..{end}");
+            if n > 1 {
+                let middle = start + 1;
+                // SAFETY: the descriptor stays live, and this test owns its ID.
+                unsafe {
+                    assert_ne!(
+                        (*a).parked[start / WORD_BITS].load(Ordering::Acquire)
+                            & (1 << (start % WORD_BITS)),
+                        0,
+                        "failed claim consumed the parked state",
+                    );
+                    assert_eq!(
+                        (*a).decommitted[middle / WORD_BITS].load(Ordering::Acquire)
+                            & (1 << (middle % WORD_BITS)),
+                        0,
+                        "successful earlier recommit was lost",
+                    );
+                }
+            }
+
+            fail_next_commits(1);
+            let got = chunk_alloc_n(id, n);
+            fail_next_commits(0);
+            assert!(got.is_none(), "failed chunk no longer requires recommit");
+
+            for j in end..chunks {
+                // SAFETY: these chunks are still held in the live reservation.
+                let chunk = unsafe { block.ptr.add(j * SEGMENT_SIZE) };
+                assert!(chunk_free_state(chunk, ChunkState::Decommitted));
+            }
+            fail_next_commits(1);
+            let got = chunk_alloc_n(id, n);
+            fail_next_commits(0);
+            assert_eq!(got, Some((alternate, false)), "scan stopped after failure");
+
+            assert_eq!(chunk_alloc_n(id, n), Some((p, false)));
+            assert!(chunk_alloc(id).is_none(), "released a neighboring claim");
+            // SAFETY: the successful retry owns the now writable final chunk.
+            unsafe { failed.write(0xA5) };
+            if n > 1 {
+                // SAFETY: the descriptor is live and private to this test.
+                assert_eq!(
+                    unsafe { (*a).parked[start / WORD_BITS].load(Ordering::Acquire) }
+                        & (1 << (start % WORD_BITS)),
+                    0,
+                );
+            }
+            assert!(chunk_free_n(p, n));
+            assert!(chunk_free_n(alternate, n));
         }
     }
 

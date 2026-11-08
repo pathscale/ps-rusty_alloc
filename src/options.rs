@@ -6,6 +6,7 @@
 //! `MIMALLOC_SHOW_STATS=1`, `MIMALLOC_PURGE_DELAY=0`. Parsed once on first
 //! option access. Values follow mimalloc: booleans accept 1/0/true/false/
 //! yes/no/on/off; sizes are plain integers (`_size` options are KiB).
+//! Hosted Unix skips environment tuning during elevated execution.
 
 use core::cell::Cell;
 use core::ffi::c_void;
@@ -438,8 +439,43 @@ mod env {
     /// Values are integers and booleans; upstream's buffer is 64 bytes as well.
     const VALUE_CAP: usize = 64;
 
+    #[cfg(all(unix, not(miri)))]
+    fn elevated_process() -> bool {
+        // SAFETY: These queries read process credentials or exec state and
+        // take no pointers.
+        unsafe {
+            let euid = libc::geteuid();
+            if euid == 0 || euid != libc::getuid() || libc::getegid() != libc::getgid() {
+                return true;
+            }
+
+            // Secure exec can also result from file capabilities or an
+            // earlier credential transition, even when the IDs now match.
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            if libc::getauxval(libc::AT_SECURE) != 0 {
+                return true;
+            }
+            #[cfg(any(
+                target_vendor = "apple",
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd"
+            ))]
+            if libc::issetugid() != 0 {
+                return true;
+            }
+        }
+        false
+    }
+
     /// `RUSTY_ALLOC_<NAME>` first, `MIMALLOC_<NAME>` second, as before.
     pub(super) fn pass() {
+        #[cfg(all(unix, not(miri)))]
+        if elevated_process() {
+            return;
+        }
+
         #[cfg(all(target_os = "linux", not(miri)))]
         {
             scan_pass();

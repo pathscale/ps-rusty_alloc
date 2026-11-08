@@ -2,10 +2,11 @@
 //! encoding keys, guarded-object sampling, and page-start randomization.
 //!
 //! Self-contained (no rand crate — the allocator cannot depend on code that
-//! allocates). Seeded from OS entropy where available, else from a mix of
-//! clock, addresses and thread id; the seed path is documented per platform
-//! so `secure` builds can state what they rest on.
+//! allocates). Native Unix requires a complete OS seed. Other targets and
+//! Miri can fall back to a mix of the clock, a stack address, the thread ID,
+//! and a counter.
 
+#[cfg(any(not(unix), miri))]
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// A ChaCha8 stream. Not `Sync`: each heap owns one (no sharing, no locks).
@@ -52,9 +53,16 @@ impl Random {
         self.used = 16;
     }
 
-    /// Seed from OS entropy plus environmental mixing.
+    /// Seed from OS entropy where available.
+    ///
+    /// On Unix outside Miri, failure to obtain a complete seed aborts the process.
     pub fn reseed(&mut self) {
         let mut key = [0u32; 8];
+        #[cfg(all(unix, not(miri)))]
+        if !os_entropy(&mut key) {
+            crate::abort();
+        }
+        #[cfg(any(not(unix), miri))]
         if !os_entropy(&mut key) {
             // Fallback mixing: clock, a stack address, a heap-ish address,
             // thread id, and a global counter (documented weaker path).

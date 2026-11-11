@@ -43,6 +43,10 @@ name = "rusty_alloc"
 path = "src/lib.rs"
 
 [[test]]
+name = "budget"
+path = "tests/budget.rs"
+
+[[test]]
 name = "abandon_rss"
 path = "tests/abandon_rss.rs"
 

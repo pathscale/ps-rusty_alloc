@@ -93,6 +93,12 @@ pub fn print_process() {
         peak_commit / 1024,
         commit_failures(),
     ));
+    out_fmt(&std::format!(
+        "segments: budget {} bytes, in-use {} bytes, peak {} bytes\n",
+        crate::budget::limit(),
+        crate::budget::committed(),
+        crate::budget::peak(),
+    ));
 }
 
 /// `mi_thread_stats_print_out`: the calling thread's heap only.

@@ -538,6 +538,11 @@ pub fn segment_alloc(arena_id: i32) -> Result<*mut Segment, PrimError> {
         (*seg).next = ptr::null_mut();
         (*seg).free_spans = ptr::null_mut();
     }
+    if !crate::budget::try_take(size) {
+        // SAFETY: fully initialized, empty, unpublished Normal segment.
+        let _ = unsafe { segment_release(seg, false) };
+        return Err(12);
+    }
     segment_map::register(seg);
     Ok(seg)
 }
@@ -632,9 +637,25 @@ unsafe fn restore_for_reuse(seg: *mut Segment) -> bool {
 /// `seg` must be a live Normal segment with `used_pages == 0` and no live
 /// blocks or references into it.
 pub unsafe fn segment_free(seg: *mut Segment) -> Result<(), PrimError> {
-    // SAFETY: seg is live per the contract; this only reads atomics.
-    unsafe { wait_no_remote_in_flight(seg) };
-    segment_map::unregister(seg);
+    // SAFETY: the caller provides an empty, live published Normal segment.
+    unsafe { segment_release(seg, true) }
+}
+
+/// Release an initialized, empty Normal segment. Unpublished segments have
+/// never been charged or exposed to remote frees.
+///
+/// # Safety
+/// `seg` must be exclusively owned and empty. `published` must be true exactly
+/// when this segment was admitted and registered by `segment_alloc`.
+unsafe fn segment_release(seg: *mut Segment, published: bool) -> Result<(), PrimError> {
+    if published {
+        // SAFETY: the published segment is live and empty per the contract.
+        unsafe {
+            wait_no_remote_in_flight(seg);
+            segment_map::unregister(seg);
+            crate::budget::release((*seg).total_size);
+        }
+    }
     // SAFETY: seg is live and empty per the contract.
     let usable = unsafe { restore_for_reuse(seg) };
     if !usable {
@@ -1346,6 +1367,11 @@ pub(crate) fn huge_alloc_with_guard(
             }
         }
         // Publish only after the final readable extent and guard are set.
+        if !crate::budget::try_take(b.size) {
+            // SAFETY: initialized, unused, unpublished Huge segment.
+            let _ = huge_release(seg, false);
+            return Err(12);
+        }
         segment_map::register_range(seg.addr(), b.size);
         Ok((seg, result))
     }
@@ -1372,6 +1398,7 @@ unsafe fn huge_release(seg: *mut Segment, published: bool) -> Result<(), PrimErr
         if published {
             wait_no_remote_in_flight(seg);
             segment_map::unregister_range(seg.addr(), (*seg).total_size);
+            crate::budget::release((*seg).total_size);
         }
         // Arena-backed huge blocks recycle their contiguous chunks — but the
         // memory must be handed back in a USABLE state: lift any guard-page

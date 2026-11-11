@@ -492,6 +492,7 @@ pub(crate) const ONE_REGION: bool = FIXED_REGION && cfg!(ra_single_threaded);
 pub mod alloc;
 pub mod arena;
 pub mod bins;
+pub mod budget;
 #[cfg(feature = "debug_checks")]
 pub mod debug;
 pub mod global;

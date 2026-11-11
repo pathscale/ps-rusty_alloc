@@ -1,5 +1,20 @@
 # `unsafe` inventory — rusty_alloc
 
+## Segment budget admission (2026-11-11)
+
+`segment.rs` adds the private `segment_release` unsafe function and two call
+blocks: public `segment_free` supplies an empty published Normal segment;
+admission refusal supplies a fully initialized empty unpublished one. Its
+published branch combines the existing remote-free barrier block with the
+header-size read, so that block is replaced rather than added. The net growth
+is three unsafe occurrences. The boolean records publication, not memory
+validity: both arms require a live header and exclusive ownership, and only
+published segments can have remote frees or a budget charge. Existing backing
+release code remains shared. Huge refusal calls the existing `huge_release`
+inside its existing unsafe block, after header and page initialization.
+`budget.rs` contains no unsafe code. `tests/budget.rs` frees only empty Normal
+segments or live malloc blocks, and writes only within the requested extent.
+
 Every `unsafe` block in the workspace carries a `// SAFETY:` invariant, and
 that is **lint-enforced**, not conventional: `clippy::undocumented_unsafe_blocks
 = deny` and `unsafe_op_in_unsafe_fn = deny` are workspace-level, and clippy

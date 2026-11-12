@@ -11,6 +11,8 @@
 use core::ffi::c_void;
 use core::ptr;
 
+use eko::libc_lite as libc;
+
 use super::{Alloc, MemConfig, PrimError, TlsDtor, align_up};
 
 fn errno() -> PrimError {

@@ -152,8 +152,9 @@ features = ["fallback"]
 optional = true
 default-features = false
 
-[target."cfg(unix)".dependencies.libc]
-version = "0.2"
+[target."cfg(unix)".dependencies.ekostd]
+path = "../ekostd"
+version = "^0.2.4"
 default-features = false
 
 [target."cfg(windows)".dependencies.windows-sys]

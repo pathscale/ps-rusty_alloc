@@ -192,6 +192,8 @@ fn win_process_info() -> (usize, usize, usize, usize, usize, usize, usize, usize
 
 #[cfg(all(unix, feature = "std", not(miri)))]
 fn unix_process_info() -> (usize, usize, usize, usize, usize, usize, usize, usize) {
+    use eko::libc_lite as libc;
+
     // SAFETY: out-param is a valid local.
     unsafe {
         let mut ru: libc::rusage = core::mem::zeroed();

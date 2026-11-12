@@ -32,6 +32,8 @@ use core::ffi::c_void;
 use core::ptr;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use eko::libc_lite as libc;
+
 /// A value that fits a TSD slot: encoded against the initial value so a NULL
 /// slot means "never set on this thread".
 pub trait KeyWord: Copy {

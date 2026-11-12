@@ -49,6 +49,7 @@ pub(crate) fn abort() -> ! {
     #[cfg(all(not(feature = "std"), unix))]
     // SAFETY: `abort` has no preconditions and does not return.
     unsafe {
+        use eko::libc_lite as libc;
         libc::abort()
     }
     #[cfg(all(not(feature = "std"), not(unix)))]

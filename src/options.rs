@@ -441,6 +441,8 @@ mod env {
 
     #[cfg(all(unix, not(miri)))]
     fn elevated_process() -> bool {
+        use eko::libc_lite as libc;
+
         // SAFETY: These queries read process credentials or exec state and
         // take no pointers.
         unsafe {
@@ -916,6 +918,7 @@ pub fn out_fmt(msg: &str) {
         #[cfg(all(unix, not(feature = "std")))]
         // SAFETY: writes `msg.len()` bytes from a live `&str` to fd 2.
         unsafe {
+            use eko::libc_lite as libc;
             let _ = libc::write(2, msg.as_ptr().cast(), msg.len());
         }
         return;

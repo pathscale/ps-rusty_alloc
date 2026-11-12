@@ -134,6 +134,7 @@ pub fn thread_stack_bounds() -> (usize, usize) {
     #[cfg(all(not(miri), target_vendor = "apple"))]
     // SAFETY: plain queries about the calling thread.
     unsafe {
+        use eko::libc_lite as libc;
         let me = libc::pthread_self();
         let hi = libc::pthread_get_stackaddr_np(me).addr();
         let size = libc::pthread_get_stacksize_np(me);
@@ -143,6 +144,7 @@ pub fn thread_stack_bounds() -> (usize, usize) {
     // SAFETY: `attr` is initialised by `pthread_getattr_np` before it is
     // read and destroyed once.
     unsafe {
+        use eko::libc_lite as libc;
         let mut attr: libc::pthread_attr_t = core::mem::zeroed();
         if libc::pthread_getattr_np(libc::pthread_self(), &mut attr) != 0 {
             return (0, 0);
@@ -402,6 +404,7 @@ pub fn image_of(addr: usize) -> Option<(&'static str, usize)> {
     // SAFETY: `dladdr` only reads the loader's tables and fills `info`; the
     // file name it points to lives as long as the image stays loaded.
     unsafe {
+        use eko::libc_lite as libc;
         let mut info: libc::Dl_info = core::mem::zeroed();
         if libc::dladdr(core::ptr::with_exposed_provenance(addr), &mut info) == 0
             || info.dli_fname.is_null()

@@ -1652,6 +1652,7 @@ fn at_exit_register() {
         }
         // SAFETY: registers a plain `extern "C"` function.
         unsafe {
+            use eko::libc_lite as libc;
             libc::atexit(at_exit);
         }
     }

@@ -525,8 +525,9 @@ pub mod types;
 
 #[cfg(feature = "audit_trace")]
 pub use audit::{
-    AuditEvent, AuditOp, AuditViolation, AuditViolationKind, ra_audit_clear_altstack,
-    ra_audit_enable, ra_audit_is_active, ra_audit_last_violation, ra_audit_recent_events,
+    AuditAnomalyCounts, AuditEvent, AuditOp, AuditViolation, AuditViolationKind,
+    audit_anomaly_counts, drain_audit_anomalies, ra_audit_clear_altstack, ra_audit_enable,
+    ra_audit_is_active, ra_audit_last_violation, ra_audit_recent_events,
     ra_audit_register_altstack, ra_audit_set_abort_on_violation, ra_audit_violation_count,
 };
 pub use bins::good_size;

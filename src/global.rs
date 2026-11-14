@@ -32,6 +32,22 @@ const WORD: usize = core::mem::size_of::<usize>();
 #[cfg(not(feature = "debug_checks"))]
 const NATURAL_ALIGN: usize = 2 * WORD;
 
+#[cfg(all(not(feature = "debug_checks"), feature = "audit_trace"))]
+#[inline(always)]
+fn expected_audit_layout(layout: Layout) -> (usize, usize) {
+    let expected_size = if layout.align() > WORD && layout.align() <= NATURAL_ALIGN {
+        layout.size().max(NATURAL_ALIGN)
+    } else {
+        layout.size()
+    };
+    let expected_align = if layout.align() <= NATURAL_ALIGN {
+        1
+    } else {
+        layout.align()
+    };
+    (expected_size, expected_align)
+}
+
 // SAFETY: every method forwards to the core allocator, which returns blocks of
 // at least the requested size and alignment, or null.
 #[cfg(not(feature = "debug_checks"))]
@@ -54,16 +70,7 @@ unsafe impl GlobalAlloc for RustyAlloc {
         #[cfg(feature = "audit_trace")]
         no_unwind!(unsafe {
             core::hint::assert_unchecked(!ptr.is_null());
-            let expected_size = if layout.align() > WORD && layout.align() <= NATURAL_ALIGN {
-                layout.size().max(NATURAL_ALIGN)
-            } else {
-                layout.size()
-            };
-            let expected_align = if layout.align() <= NATURAL_ALIGN {
-                1
-            } else {
-                layout.align()
-            };
+            let (expected_size, expected_align) = expected_audit_layout(layout);
             crate::alloc::free_inline_layout(ptr, expected_size, expected_align)
         });
         #[cfg(not(feature = "audit_trace"))]
@@ -88,6 +95,14 @@ unsafe impl GlobalAlloc for RustyAlloc {
     #[inline]
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         if layout.align() <= NATURAL_ALIGN {
+            #[cfg(feature = "audit_trace")]
+            if crate::audit::is_active() {
+                let (expected_size, expected_align) = expected_audit_layout(layout);
+                // SAFETY: `ptr` is non-null per `GlobalAlloc::realloc` contract.
+                unsafe {
+                    crate::audit::check_live_layout(ptr, expected_size, expected_align);
+                }
+            }
             let new_size = if layout.align() <= WORD {
                 new_size
             } else {
@@ -102,6 +117,15 @@ unsafe impl GlobalAlloc for RustyAlloc {
             // SAFETY: the caller passes a live pointer from this allocator.
             let usable = no_unwind!(unsafe { crate::alloc::usable_size(ptr) });
             if new_size <= usable && new_size >= usable / 2 {
+                #[cfg(feature = "audit_trace")]
+                if crate::audit::is_active() {
+                    let (expected_size, expected_align) = expected_audit_layout(layout);
+                    // SAFETY: `ptr` is non-null per `GlobalAlloc::realloc` contract.
+                    unsafe {
+                        crate::audit::check_live_layout(ptr, expected_size, expected_align);
+                        crate::audit::on_realloc_in_place(ptr, new_size);
+                    }
+                }
                 return ptr;
             }
             // SAFETY: `new_size` with the old power-of-two alignment is a valid

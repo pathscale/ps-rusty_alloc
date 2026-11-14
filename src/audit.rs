@@ -99,6 +99,10 @@ pub enum AuditViolationKind {
 }
 
 impl AuditViolationKind {
+    /// Alias for [`AuditViolationKind::WriteAfterFree`] highlighting quarantine poison corruption.
+    #[allow(non_upper_case_globals)]
+    pub const QuarantineWriteCorrupted: Self = Self::WriteAfterFree;
+
     const fn name(self) -> &'static str {
         match self {
             Self::DoubleFree => "double_free",
@@ -168,7 +172,114 @@ static QUARANTINE_BUDGET: AtomicUsize = AtomicUsize::new(DEFAULT_QUARANTINE_BYTE
 
 /// Total violations recorded.
 static VIOLATION_COUNT: AtomicUsize = AtomicUsize::new(0);
-/// Lock protecting `LAST_VIOLATION`.
+/// Per-kind atomic anomaly counters.
+static DOUBLE_FREE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static INVALID_FREE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static LAYOUT_MISMATCH_COUNT: AtomicUsize = AtomicUsize::new(0);
+static QUARANTINE_WRITE_CORRUPTED_COUNT: AtomicUsize = AtomicUsize::new(0);
+static ALTSTACK_HAZARD_COUNT: AtomicUsize = AtomicUsize::new(0);
+static FORK_HAZARD_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Snapshot of atomic anomaly counts recorded by `audit_trace`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AuditAnomalyCounts {
+    /// Total violations recorded across all categories.
+    pub total: usize,
+    /// Double-free or stale-generation quarantine violations.
+    pub double_free: usize,
+    /// Invalid/untracked pointer free or realloc violations.
+    pub invalid_free: usize,
+    /// Deallocation or realloc `(size, align)` mismatches.
+    pub layout_mismatch: usize,
+    /// Quarantined `0xDE` poison-byte corruption (use-after-free write).
+    pub quarantine_write_corrupted: usize,
+    /// `sigaltstack` unmap/atexit lifecycle hazards.
+    pub altstack_unmap_hazard: usize,
+    /// Multithreaded `fork()` lock-held hazards.
+    pub multithreaded_fork_hazard: usize,
+}
+
+/// Capacity of the anonymous-mmap'd anomaly drain ring (power of two).
+const ANOMALY_RING_CAP: usize = 1024;
+
+struct AnomalyQueue {
+    buf: *mut AuditViolation,
+    head: usize,
+    tail: usize,
+    len: usize,
+}
+
+impl AnomalyQueue {
+    const fn new() -> Self {
+        Self {
+            buf: ptr::null_mut(),
+            head: 0,
+            tail: 0,
+            len: 0,
+        }
+    }
+
+    /// # Safety
+    /// Caller must hold `VIOLATION_LOCK`.
+    unsafe fn ensure_init(&mut self) -> bool {
+        if !self.buf.is_null() {
+            return true;
+        }
+        let bytes = ANOMALY_RING_CAP * core::mem::size_of::<AuditViolation>();
+        // SAFETY: `bytes` is nonzero; `os_mmap_zeroed` returns zeroed pages or null.
+        let mem = unsafe { os_mmap_zeroed(bytes) };
+        if mem.is_null() {
+            return false;
+        }
+        self.buf = mem.cast();
+        true
+    }
+
+    /// # Safety
+    /// Caller must hold `VIOLATION_LOCK`.
+    unsafe fn push(&mut self, v: AuditViolation) {
+        // SAFETY: caller holds `VIOLATION_LOCK`.
+        if !unsafe { self.ensure_init() } {
+            return;
+        }
+        if self.len == ANOMALY_RING_CAP {
+            // Overwrite oldest entry when full.
+            self.head = (self.head + 1) & (ANOMALY_RING_CAP - 1);
+            self.len -= 1;
+        }
+        // SAFETY: `self.tail < ANOMALY_RING_CAP` and `self.buf` is initialized.
+        unsafe {
+            self.buf.add(self.tail).write(v);
+        }
+        self.tail = (self.tail + 1) & (ANOMALY_RING_CAP - 1);
+        self.len += 1;
+    }
+
+    /// # Safety
+    /// Caller must hold `VIOLATION_LOCK`.
+    unsafe fn drain(&mut self, out: &mut [AuditViolation]) -> usize {
+        if self.buf.is_null() || self.len == 0 || out.is_empty() {
+            return 0;
+        }
+        let n = self.len.min(out.len());
+        for slot in out.iter_mut().take(n) {
+            // SAFETY: `self.head < ANOMALY_RING_CAP` and `self.buf` is initialized.
+            *slot = unsafe { self.buf.add(self.head).read() };
+            self.head = (self.head + 1) & (ANOMALY_RING_CAP - 1);
+            self.len -= 1;
+        }
+        n
+    }
+}
+
+struct SyncAnomalyQueueCell(UnsafeCell<AnomalyQueue>);
+// SAFETY: all accesses to `ANOMALY_QUEUE` are serialized by `VIOLATION_LOCK`.
+unsafe impl Sync for SyncAnomalyQueueCell {}
+
+static ANOMALY_QUEUE: SyncAnomalyQueueCell =
+    SyncAnomalyQueueCell(UnsafeCell::new(AnomalyQueue::new()));
+
+/// Lock protecting `LAST_VIOLATION` and `ANOMALY_QUEUE`.
 static VIOLATION_LOCK: AtomicBool = AtomicBool::new(false);
 struct SyncViolationCell(UnsafeCell<AuditViolation>);
 // SAFETY: all accesses to `LAST_VIOLATION` are serialized by `VIOLATION_LOCK`.
@@ -602,15 +713,36 @@ impl core::fmt::Write for StackBuf {
 
 fn record_violation(v: AuditViolation) {
     VIOLATION_COUNT.fetch_add(1, Ordering::Relaxed);
+    match v.kind {
+        AuditViolationKind::DoubleFree => {
+            DOUBLE_FREE_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        AuditViolationKind::InvalidFree => {
+            INVALID_FREE_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        AuditViolationKind::LayoutMismatch => {
+            LAYOUT_MISMATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        AuditViolationKind::WriteAfterFree => {
+            QUARANTINE_WRITE_CORRUPTED_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        AuditViolationKind::AltstackUnmapHazard => {
+            ALTSTACK_HAZARD_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        AuditViolationKind::MultithreadedForkHazard => {
+            FORK_HAZARD_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+    }
     while VIOLATION_LOCK
         .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
     {
         core::hint::spin_loop();
     }
-    // SAFETY: `VIOLATION_LOCK` serializes writes to `LAST_VIOLATION`.
+    // SAFETY: `VIOLATION_LOCK` serializes writes to `LAST_VIOLATION` and `ANOMALY_QUEUE`.
     unsafe {
         LAST_VIOLATION.0.get().write(v);
+        (*ANOMALY_QUEUE.0.get()).push(v);
     }
     HAS_LAST_VIOLATION.store(true, Ordering::Release);
     VIOLATION_LOCK.store(false, Ordering::Release);
@@ -859,6 +991,36 @@ pub fn ra_audit_violation_count() -> usize {
     VIOLATION_COUNT.load(Ordering::Acquire)
 }
 
+/// Return a snapshot of per-category atomic anomaly counters.
+pub fn audit_anomaly_counts() -> AuditAnomalyCounts {
+    AuditAnomalyCounts {
+        total: VIOLATION_COUNT.load(Ordering::Acquire),
+        double_free: DOUBLE_FREE_COUNT.load(Ordering::Acquire),
+        invalid_free: INVALID_FREE_COUNT.load(Ordering::Acquire),
+        layout_mismatch: LAYOUT_MISMATCH_COUNT.load(Ordering::Acquire),
+        quarantine_write_corrupted: QUARANTINE_WRITE_CORRUPTED_COUNT.load(Ordering::Acquire),
+        altstack_unmap_hazard: ALTSTACK_HAZARD_COUNT.load(Ordering::Acquire),
+        multithreaded_fork_hazard: FORK_HAZARD_COUNT.load(Ordering::Acquire),
+    }
+}
+
+/// Drain up to `out.len()` buffered [`AuditViolation`] anomaly records in FIFO order.
+pub fn drain_audit_anomalies(out: &mut [AuditViolation]) -> usize {
+    if out.is_empty() {
+        return 0;
+    }
+    while VIOLATION_LOCK
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    // SAFETY: `VIOLATION_LOCK` serializes access to `ANOMALY_QUEUE`.
+    let n = unsafe { (*ANOMALY_QUEUE.0.get()).drain(out) };
+    VIOLATION_LOCK.store(false, Ordering::Release);
+    n
+}
+
 /// Return the most recently recorded violation, if any.
 pub fn ra_audit_last_violation() -> Option<AuditViolation> {
     if !HAS_LAST_VIOLATION.load(Ordering::Acquire) {
@@ -933,6 +1095,93 @@ pub(crate) unsafe fn on_alloc_explicit(p: *mut u8, req_size: usize, req_align: u
     };
     unlock_tables();
     RING.push(AuditOp::Alloc, addr, req_size, req_align, generation_id);
+}
+
+/// Validate that a live block's recorded `(size, align)` matches `(expected_size, expected_align)`
+/// before `realloc` proceeds.
+///
+/// # Safety
+/// `p` must be a non-null pointer.
+pub(crate) unsafe fn check_live_layout(
+    p: *mut u8,
+    expected_size: usize,
+    expected_align: usize,
+) {
+    let addr = p.addr();
+    let tid = crate::init::thread_id();
+    let mut violation: Option<AuditViolation> = None;
+    let mut waf: Option<AuditViolation> = None;
+    lock_tables();
+    // SAFETY: `AUDIT_LOCK` is held.
+    unsafe {
+        let t = &mut *TABLES.0.get();
+        if t.ensure_init() {
+            if let Some(idx) = t.find_slot(addr) {
+                let entry = &mut *t.shadow.add(idx);
+                if entry.state == EntryState::Quarantined {
+                    let poison_len = entry.usable_size.max(entry.req_size);
+                    for off in 0..poison_len {
+                        if p.add(off).read() != POISON_BYTE {
+                            waf = Some(AuditViolation {
+                                kind: AuditViolationKind::WriteAfterFree,
+                                ptr: addr,
+                                expected_size: poison_len,
+                                expected_align: 0,
+                                actual_size: 0,
+                                actual_align: 0,
+                                offset: off,
+                                generation: entry.generation,
+                                thread_id: tid,
+                            });
+                            break;
+                        }
+                    }
+                    violation = Some(AuditViolation {
+                        kind: AuditViolationKind::DoubleFree,
+                        ptr: addr,
+                        expected_size: entry.req_size,
+                        expected_align: entry.req_align,
+                        actual_size: expected_size,
+                        actual_align: expected_align,
+                        offset: 0,
+                        generation: entry.generation,
+                        thread_id: tid,
+                    });
+                } else if entry.req_size != expected_size || entry.req_align != expected_align {
+                    violation = Some(AuditViolation {
+                        kind: AuditViolationKind::LayoutMismatch,
+                        ptr: addr,
+                        expected_size: entry.req_size,
+                        expected_align: entry.req_align,
+                        actual_size: expected_size,
+                        actual_align: expected_align,
+                        offset: 0,
+                        generation: entry.generation,
+                        thread_id: tid,
+                    });
+                }
+            } else {
+                violation = Some(AuditViolation {
+                    kind: AuditViolationKind::InvalidFree,
+                    ptr: addr,
+                    expected_size: 0,
+                    expected_align: 0,
+                    actual_size: expected_size,
+                    actual_align: expected_align,
+                    offset: 0,
+                    generation: 0,
+                    thread_id: tid,
+                });
+            }
+        }
+    }
+    unlock_tables();
+    if let Some(v) = violation {
+        record_violation(v);
+    }
+    if let Some(v) = waf {
+        record_violation(v);
+    }
 }
 
 /// Validate and update a live block during an in-place `realloc`.
@@ -1039,6 +1288,26 @@ pub(crate) unsafe fn on_free(
                 rec_align = entry.req_align;
 
                 if entry.state == EntryState::Quarantined {
+                    let poison_len = entry.usable_size.max(entry.req_size);
+                    for off in 0..poison_len {
+                        if user_ptr.add(off).read() != POISON_BYTE {
+                            if wafs_len < wafs.len() {
+                                wafs[wafs_len] = AuditViolation {
+                                    kind: AuditViolationKind::WriteAfterFree,
+                                    ptr: addr,
+                                    expected_size: poison_len,
+                                    expected_align: 0,
+                                    actual_size: 0,
+                                    actual_align: 0,
+                                    offset: off,
+                                    generation: generation_id,
+                                    thread_id: tid,
+                                };
+                                wafs_len += 1;
+                            }
+                            break;
+                        }
+                    }
                     immediate_violation = Some(AuditViolation {
                         kind: AuditViolationKind::DoubleFree,
                         ptr: addr,

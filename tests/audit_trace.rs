@@ -6,9 +6,10 @@ use rusty_alloc::alloc::{
     free, free_aligned_sized, free_sized, malloc, malloc_aligned, realloc,
 };
 use rusty_alloc::{
-    AuditEvent, AuditOp, AuditViolationKind, RustyAlloc, ra_audit_clear_altstack,
-    ra_audit_enable, ra_audit_is_active, ra_audit_last_violation, ra_audit_recent_events,
-    ra_audit_register_altstack, ra_audit_set_abort_on_violation, ra_audit_violation_count,
+    AuditEvent, AuditOp, AuditViolation, AuditViolationKind, RustyAlloc, audit_anomaly_counts,
+    drain_audit_anomalies, ra_audit_clear_altstack, ra_audit_enable, ra_audit_is_active,
+    ra_audit_last_violation, ra_audit_recent_events, ra_audit_register_altstack,
+    ra_audit_set_abort_on_violation, ra_audit_violation_count,
 };
 
 #[test]
@@ -125,4 +126,84 @@ fn audit_trace_end_to_end() {
     let last = ra_audit_last_violation().expect("altstack unmap hazard");
     assert_eq!(last.kind, AuditViolationKind::AltstackUnmapHazard);
     ra_audit_clear_altstack();
+
+    // 7. Drain anomaly buffer, test GlobalAlloc::realloc LayoutMismatch,
+    //    quarantined DoubleFree + QuarantineWriteCorrupted, and atomic counters.
+    let mut scratch = [AuditViolation {
+        kind: AuditViolationKind::InvalidFree,
+        ptr: 0,
+        expected_size: 0,
+        expected_align: 0,
+        actual_size: 0,
+        actual_align: 0,
+        offset: 0,
+        generation: 0,
+        thread_id: 0,
+    }; 64];
+    let _ = drain_audit_anomalies(&mut scratch);
+
+    ra_audit_enable(true);
+    let counts_before = audit_anomaly_counts();
+
+    // 7a. GlobalAlloc::realloc with mismatched Layout (size/align).
+    let r_layout = Layout::from_size_align(64, 8).expect("valid layout");
+    let r_wrong = Layout::from_size_align(32, 8).expect("valid layout");
+    // SAFETY: `r_layout` is valid and non-zero.
+    let rp_ga = unsafe { ga.alloc(r_layout) };
+    assert!(!rp_ga.is_null());
+    // SAFETY: deliberate LayoutMismatch on GlobalAlloc::realloc in non-aborting audit mode.
+    let rp_ga2 = unsafe { ga.realloc(rp_ga, r_wrong, 48) };
+    assert!(!rp_ga2.is_null());
+    // SAFETY: free with the updated size (48) and original align (8).
+    let r_free = Layout::from_size_align(48, 8).expect("valid layout");
+    unsafe { ga.dealloc(rp_ga2, r_free) };
+
+    // 7b. Corrupt 0xDE quarantine poison bytes, then trigger DoubleFree on the corrupted slot.
+    let q_layout = Layout::from_size_align(64, 16).expect("valid layout");
+    // SAFETY: `q_layout` is valid and non-zero.
+    let qp = unsafe { ga.alloc(q_layout) };
+    assert!(!qp.is_null());
+    // SAFETY: `qp` was allocated with `q_layout`.
+    unsafe { ga.dealloc(qp, q_layout) };
+    // SAFETY: deliberate UAF write into 0xDE quarantine.
+    unsafe { qp.add(3).write(0x77) };
+    // SAFETY: deliberate DoubleFree on corrupted quarantined block.
+    unsafe { ga.dealloc(qp, q_layout) };
+
+    ra_audit_enable(false);
+
+    let counts_after = audit_anomaly_counts();
+    assert!(
+        counts_after.layout_mismatch > counts_before.layout_mismatch,
+        "expected layout_mismatch counter to increment"
+    );
+    assert!(
+        counts_after.double_free > counts_before.double_free,
+        "expected double_free counter to increment"
+    );
+    assert!(
+        counts_after.quarantine_write_corrupted > counts_before.quarantine_write_corrupted,
+        "expected quarantine_write_corrupted counter to increment"
+    );
+
+    let drained = drain_audit_anomalies(&mut scratch);
+    assert!(drained >= 3, "expected at least 3 drained anomalies, got {drained}");
+    assert!(
+        scratch[..drained]
+            .iter()
+            .any(|v| v.kind == AuditViolationKind::LayoutMismatch && v.ptr == rp_ga.addr())
+    );
+    assert!(
+        scratch[..drained]
+            .iter()
+            .any(|v| v.kind == AuditViolationKind::DoubleFree && v.ptr == qp.addr())
+    );
+    assert!(
+        scratch[..drained]
+            .iter()
+            .any(|v| v.kind == AuditViolationKind::QuarantineWriteCorrupted
+                && v.ptr == qp.addr()
+                && v.offset == 3)
+    );
+    assert_eq!(drain_audit_anomalies(&mut scratch), 0);
 }

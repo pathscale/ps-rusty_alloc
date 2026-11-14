@@ -648,14 +648,16 @@ pub unsafe fn segment_free(seg: *mut Segment) -> Result<(), PrimError> {
 /// `seg` must be exclusively owned and empty. `published` must be true exactly
 /// when this segment was admitted and registered by `segment_alloc`.
 unsafe fn segment_release(seg: *mut Segment, published: bool) -> Result<(), PrimError> {
-    if published {
-        // SAFETY: the published segment is live and empty per the contract.
-        unsafe {
-            wait_no_remote_in_flight(seg);
-            segment_map::unregister(seg);
-            crate::budget::release((*seg).total_size);
+        if published {
+            // SAFETY: the published segment is live and empty per the contract.
+            unsafe {
+                wait_no_remote_in_flight(seg);
+                #[cfg(feature = "audit_trace")]
+                crate::audit::check_altstack_unmap(seg.cast::<u8>(), (*seg).total_size);
+                segment_map::unregister(seg);
+                crate::budget::release((*seg).total_size);
+            }
         }
-    }
     // SAFETY: seg is live and empty per the contract.
     let usable = unsafe { restore_for_reuse(seg) };
     if !usable {
@@ -1397,6 +1399,8 @@ unsafe fn huge_release(seg: *mut Segment, published: bool) -> Result<(), PrimErr
         // Every route by which memory can reach an arena needs it.
         if published {
             wait_no_remote_in_flight(seg);
+            #[cfg(feature = "audit_trace")]
+            crate::audit::check_altstack_unmap(seg.cast::<u8>(), (*seg).total_size);
             segment_map::unregister_range(seg.addr(), (*seg).total_size);
             crate::budget::release((*seg).total_size);
         }

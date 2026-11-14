@@ -377,6 +377,10 @@ impl Heap {
     /// hence the debug assertion.
     fn malloc_in_bin(&mut self, size: usize, bin: usize) -> (*mut u8, bool) {
         ra_debug_assert_eq!(bin, bins::bin(size), "malloc_in_bin: bin/size disagree");
+        #[cfg(feature = "audit_trace")]
+        if crate::audit::is_active() {
+            return self.malloc_generic(size);
+        }
         // MEDIUM sizes get a fast path too.
         //
         // `direct[]` is indexed by word size and stops at SMALL_WSIZE_MAX, so
@@ -529,6 +533,11 @@ impl Heap {
     #[inline]
     pub(crate) fn malloc_generic(&mut self, size: usize) -> (*mut u8, bool) {
         let (p, z) = self.malloc_generic_once(size);
+        #[cfg(feature = "audit_trace")]
+        if !p.is_null() && crate::audit::is_active() {
+            // SAFETY: `p` is a newly allocated live block from this heap.
+            unsafe { crate::audit::on_alloc(p, size, 1) };
+        }
         (p, z != 0)
     }
 
@@ -1005,7 +1014,15 @@ impl Heap {
             (*p).free = ptr::null_mut();
             (*p).local_free = ptr::null_mut();
             (*p).bin = bin as u8;
-            (*p).flags.store(0, Ordering::Relaxed);
+            #[cfg(feature = "audit_trace")]
+            let init_flags = if crate::audit::is_active() {
+                pflags::AUDIT_TRACED
+            } else {
+                0
+            };
+            #[cfg(not(feature = "audit_trace"))]
+            let init_flags = 0;
+            (*p).flags.store(init_flags, Ordering::Relaxed);
             // Bump-fresh spans of an eager-committed zero mapping are zero;
             // RECLAIMED spans are recycled memory and are not.
             (*p).free_is_zero = fresh;
@@ -1157,7 +1174,15 @@ impl Heap {
             {
                 (*p).payload = ptr::null_mut();
             }
-            (*p).flags.store(pflags::SINGLE_BLOCK, Ordering::Relaxed); // unqueued single-block span
+            #[cfg(feature = "audit_trace")]
+            let init_flags = if crate::audit::is_active() {
+                pflags::SINGLE_BLOCK | pflags::AUDIT_TRACED
+            } else {
+                pflags::SINGLE_BLOCK
+            };
+            #[cfg(not(feature = "audit_trace"))]
+            let init_flags = pflags::SINGLE_BLOCK;
+            (*p).flags.store(init_flags, Ordering::Relaxed); // unqueued single-block span
             (*p).free_is_zero = fresh;
             // Unqueued → never scanned → remote frees must go via the
             // delayed list (same rule as parked-full pages).
@@ -1208,10 +1233,15 @@ impl Heap {
                 unsafe {
                     let pg: *mut Page = &raw mut (*seg).pages[1];
                     (*pg).xheap.store(self.delayed as usize, Ordering::Release);
-                    (*pg).flags.fetch_or(
-                        pflags::HUGE_SEGMENT | pflags::SINGLE_BLOCK,
-                        Ordering::Relaxed,
-                    );
+                    #[cfg(feature = "audit_trace")]
+                    let add_flags = if crate::audit::is_active() {
+                        pflags::HUGE_SEGMENT | pflags::SINGLE_BLOCK | pflags::AUDIT_TRACED
+                    } else {
+                        pflags::HUGE_SEGMENT | pflags::SINGLE_BLOCK
+                    };
+                    #[cfg(not(feature = "audit_trace"))]
+                    let add_flags = pflags::HUGE_SEGMENT | pflags::SINGLE_BLOCK;
+                    (*pg).flags.fetch_or(add_flags, Ordering::Relaxed);
                     page_set_flag(pg, XFLAG_DELAYED);
                     (*seg).next = self.huge_segments;
                     self.huge_segments = seg;
@@ -1368,6 +1398,28 @@ impl Heap {
     #[cold]
     #[inline(never)]
     pub(crate) fn malloc_aligned_at_slow(
+        &mut self,
+        size: usize,
+        align: usize,
+        offset: usize,
+    ) -> (*mut u8, bool) {
+        #[cfg(feature = "audit_trace")]
+        if crate::audit::is_active() {
+            let (p, z) = {
+                let _guard = crate::audit::SuppressGuard::new();
+                self.malloc_aligned_at_slow_inner(size, align, offset)
+            };
+            if !p.is_null() {
+                // SAFETY: `p` is a newly allocated live aligned block.
+                unsafe { crate::audit::on_alloc_explicit(p, size, align) };
+            }
+            return (p, z);
+        }
+        self.malloc_aligned_at_slow_inner(size, align, offset)
+    }
+
+    #[inline(always)]
+    fn malloc_aligned_at_slow_inner(
         &mut self,
         size: usize,
         align: usize,
@@ -1757,6 +1809,10 @@ impl Heap {
                         // docs/opps.md #9. It IS a latency win (no lock prefix
                         // on the common path); this project's metric is Ir.
                         (*slot).flags.fetch_and(!pflags::IN_FULL, Ordering::Relaxed);
+                        #[cfg(feature = "audit_trace")]
+                        if crate::audit::is_active() {
+                            (*slot).flags.fetch_or(pflags::AUDIT_TRACED, Ordering::Relaxed);
+                        }
                         // `next`/`prev` are NOT cleared here: `queue_push_front`
                         // below writes both unconditionally (`prev = null`,
                         // `next = q.first`), and nothing between here and there
@@ -2239,6 +2295,8 @@ impl Heap {
         // An empty queue publishes the sentinel, not null, so `malloc` never
         // has to test for a missing page.
         let page = match self.pages[bin].first {
+            #[cfg(feature = "audit_trace")]
+            _ if crate::audit::is_active() => crate::page::empty_page_ptr(),
             p if p.is_null() => crate::page::empty_page_ptr(),
             p => p,
         };

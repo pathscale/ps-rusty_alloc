@@ -30,6 +30,7 @@ resolver = "2"
 exclude = ["bench", "tools"]
 
 [features]
+audit_trace = []
 blockmap = []
 debug_checks = []
 default = ["std"]
@@ -41,6 +42,11 @@ std = ["dep:portable-atomic"]
 [lib]
 name = "rusty_alloc"
 path = "src/lib.rs"
+
+[[test]]
+name = "audit_trace"
+path = "tests/audit_trace.rs"
+required-features = ["audit_trace"]
 
 [[test]]
 name = "budget"

@@ -695,7 +695,12 @@ unsafe fn malloc_aligned_slow(
         // SAFETY: raw reads on a non-sentinel box, as the hot entry does.
         unsafe {
             let mask = align.wrapping_sub(1);
-            if offset == 0
+            #[cfg(feature = "audit_trace")]
+            let audit_off = !crate::audit::is_active();
+            #[cfg(not(feature = "audit_trace"))]
+            let audit_off = true;
+            if audit_off
+                && offset == 0
                 && size > SMALL_SIZE_MAX
                 && size <= crate::types::MEDIUM_OBJ_SIZE_MAX
                 && mask < crate::types::SEGMENT_SIZE / 2
@@ -887,6 +892,11 @@ pub unsafe fn realloc_aligned_at(
         && newsize >= usable / 2
         && crate::bins::is_aligned_at(p.addr(), offset, align)
     {
+        #[cfg(feature = "audit_trace")]
+        if crate::audit::is_active() {
+            // SAFETY: `p` is non-null per caller contract.
+            unsafe { crate::audit::on_realloc_in_place(p, newsize) };
+        }
         stat_realloc(true);
         return p;
     }
@@ -969,6 +979,11 @@ pub unsafe fn rezalloc_aligned_at(
         && newsize >= usable / 2
         && crate::bins::is_aligned_at(p.addr(), offset, align)
     {
+        #[cfg(feature = "audit_trace")]
+        if crate::audit::is_active() {
+            // SAFETY: `p` is non-null per caller contract.
+            unsafe { crate::audit::on_realloc_in_place(p, newsize) };
+        }
         stat_realloc(true);
         return p;
     }
@@ -1045,6 +1060,80 @@ pub unsafe fn free(p: *mut u8) {
     unsafe { free_inline(p) }
 }
 
+/// Free a block with an expected requested size (`free_sized`).
+///
+/// # Safety
+/// `p` must be null or a pointer obtained from this allocator with `size`.
+pub unsafe fn free_sized(p: *mut u8, size: usize) {
+    #[cfg(feature = "audit_trace")]
+    // SAFETY: forwarded contract.
+    unsafe {
+        free_inline_checked(p, Some(size), None);
+    }
+    #[cfg(not(feature = "audit_trace"))]
+    {
+        let _ = size;
+        // SAFETY: forwarded contract.
+        unsafe { free_inline(p) };
+    }
+}
+
+/// Free a block with expected requested size and alignment (`free_aligned_sized`).
+///
+/// # Safety
+/// `p` must be null or a pointer obtained from this allocator with `(size, align)`.
+pub unsafe fn free_aligned_sized(p: *mut u8, size: usize, align: usize) {
+    #[cfg(feature = "audit_trace")]
+    // SAFETY: forwarded contract.
+    unsafe {
+        free_inline_checked(p, Some(size), Some(align));
+    }
+    #[cfg(not(feature = "audit_trace"))]
+    {
+        let _ = (size, align);
+        // SAFETY: forwarded contract.
+        unsafe { free_inline(p) };
+    }
+}
+
+/// Layout-checked `free_inline` for `GlobalAlloc::dealloc` under `audit_trace`.
+///
+/// # Safety
+/// As [`free`].
+#[cfg(feature = "audit_trace")]
+#[inline(always)]
+pub(crate) unsafe fn free_inline_layout(p: *mut u8, size: usize, align: usize) {
+    // SAFETY: forwarded contract.
+    unsafe { free_inline_checked(p, Some(size), Some(align)) };
+}
+
+/// Release a quarantined block directly to its owning heap or remote list
+/// without re-entering `audit::on_free`.
+///
+/// # Safety
+/// `block` must be a valid block start owned by this allocator.
+#[cfg(feature = "audit_trace")]
+pub(crate) unsafe fn free_bypass_audit(block: *mut u8) {
+    if block.is_null() {
+        return;
+    }
+    let seg = segment_of(block);
+    // SAFETY: `block` is a valid block start in `seg`.
+    unsafe {
+        let owner_tid = if crate::ONE_THREAD {
+            0
+        } else {
+            (*seg).thread_id.load(Ordering::Acquire)
+        };
+        let pg = page_of(seg, block);
+        if crate::ONE_THREAD || owner_tid == init::thread_id() {
+            free_local_owned(seg, pg, block);
+        } else {
+            remote_free(seg, pg, block.cast::<Block>());
+        }
+    }
+}
+
 /// The body of [`free`], for the ONE caller that should carry it inline: the
 /// LD_PRELOAD override's exported `free`, which otherwise pays a GOT-indirect
 /// `jmp` thunk on every call. This is NOT the thrice-refuted "#[inline] on
@@ -1057,6 +1146,90 @@ pub unsafe fn free(p: *mut u8) {
 /// As [`free`].
 #[inline(always)]
 pub unsafe fn free_inline(p: *mut u8) {
+    #[cfg(feature = "audit_trace")]
+    // SAFETY: forwarded contract.
+    unsafe {
+        free_inline_checked(p, None, None);
+    }
+    #[cfg(not(feature = "audit_trace"))]
+    // SAFETY: forwarded contract.
+    unsafe {
+        free_inline_core(p);
+    }
+}
+
+#[cfg(feature = "audit_trace")]
+#[inline(always)]
+unsafe fn free_inline_checked(
+    p: *mut u8,
+    expected_size: Option<usize>,
+    expected_align: Option<usize>,
+) {
+    #[cfg(feature = "debug_checks")]
+    // SAFETY: forwarded contract.
+    if unsafe { crate::debug::raw::free(p) } {
+        return;
+    }
+    if p.is_null() {
+        return;
+    }
+    debug_foreign_pointer_guard(p);
+    let seg = segment_of(p);
+    // SAFETY: as `free_inline_core`.
+    unsafe {
+        let owner_tid = if crate::ONE_THREAD {
+            0
+        } else {
+            (*seg).thread_id.load(Ordering::Acquire)
+        };
+        #[cfg(not(all(target_arch = "x86_64", target_os = "linux", not(miri))))]
+        let local = crate::ONE_THREAD || owner_tid == init::thread_id();
+        let pg = page_of(seg, p);
+        let flags = (*pg).flags.load(Ordering::Relaxed);
+        if flags & pflags::SLOW_FREE == 0 {
+            #[cfg(all(target_arch = "x86_64", target_os = "linux", not(miri)))]
+            core::arch::asm!(
+                "cmp {tid}, fs:0",
+                "jne {remote}",
+                tid = in(reg) owner_tid,
+                remote = label {
+                    // SAFETY: `pg` is the live page this free resolved.
+                    unsafe { remote_free(seg, pg, p.cast::<Block>()) };
+                    return;
+                },
+                options(nostack, readonly),
+            );
+            #[cfg(not(all(target_arch = "x86_64", target_os = "linux", not(miri))))]
+            if !local {
+                remote_free(seg, pg, p.cast::<Block>());
+                return;
+            }
+            {
+                ra_debug_assert_eq!((*seg).kind, SegmentKind::Normal);
+                ra_debug_assert_ne!((*pg).bin as usize, BIN_HUGE);
+                crate::page::page_link_local(pg, p.cast::<Block>());
+                #[cfg(debug_assertions)]
+                {
+                    (*owner_heap(pg)).stats.frees += 1;
+                }
+                let u = (*pg).used.wrapping_sub(1);
+                (*pg).used = u;
+                if (u as i32) <= 0 {
+                    if (u as usize | (*pg).next.addr() | (*pg).prev.addr()) == 0 {
+                        return;
+                    }
+                    return retire_or_abort(pg);
+                }
+            }
+            return;
+        }
+        free_general_checked(p, seg, pg, owner_tid, expected_size, expected_align);
+    }
+}
+
+#[cfg(not(feature = "audit_trace"))]
+#[inline(always)]
+unsafe fn free_inline_core(p: *mut u8) {
     // Debug mode checks every free; the core takes over only for a block
     // without a debug header (a block start), which includes the debug
     // layer's own frees of the core blocks under its blocks.
@@ -1384,6 +1557,41 @@ unsafe fn retire_or_abort(pg: *mut Page) {
 #[cold]
 #[inline(never)]
 unsafe fn free_general(p: *mut u8, seg: *mut Segment, pg: *mut Page, owner_tid: usize) {
+    // SAFETY: forwarded contract.
+    unsafe { free_general_core(p, seg, pg, owner_tid) };
+}
+
+#[cfg(feature = "audit_trace")]
+#[cold]
+#[inline(never)]
+unsafe fn free_general_checked(
+    p: *mut u8,
+    seg: *mut Segment,
+    pg: *mut Page,
+    owner_tid: usize,
+    expected_size: Option<usize>,
+    expected_align: Option<usize>,
+) {
+    // SAFETY: forwarded contract from `free`.
+    unsafe {
+        let flags = (*pg).flags.load(Ordering::Relaxed);
+        let block = if flags & pflags::HAS_ALIGNED != 0 && flags & pflags::HUGE_SEGMENT == 0 {
+            unalign(pg, p)
+        } else {
+            p
+        };
+        if crate::audit::is_active() {
+            match crate::audit::on_free(block, p, expected_size, expected_align) {
+                crate::audit::FreeAction::Quarantined | crate::audit::FreeAction::Skip => return,
+                crate::audit::FreeAction::ReleaseNow => {}
+            }
+        }
+        free_general_dispatch(seg, pg, owner_tid, block);
+    }
+}
+
+#[inline(always)]
+unsafe fn free_general_core(p: *mut u8, seg: *mut Segment, pg: *mut Page, owner_tid: usize) {
     // SAFETY: forwarded contract from `free`.
     unsafe {
         // `seg` and `pg` come from the caller, which has just derived them.
@@ -1437,7 +1645,19 @@ unsafe fn free_general(p: *mut u8, seg: *mut Segment, pg: *mut Page, owner_tid: 
         } else {
             p
         };
-        // On x86-64 the comparison IS the branch: `thread_id()` is the fs
+        free_general_dispatch(seg, pg, owner_tid, block);
+    }
+}
+
+#[inline(always)]
+unsafe fn free_general_dispatch(
+    seg: *mut Segment,
+    pg: *mut Page,
+    owner_tid: usize,
+    block: *mut u8,
+) {
+    // SAFETY: forwarded contract from `free_general_core` / `free_general_checked`.
+    unsafe {
         // base, so the compare can take `fs:0` as its memory operand instead
         // of loading it into a register first. Same fusion as the fast path's.
         #[cfg(all(target_arch = "x86_64", target_os = "linux", not(miri)))]
@@ -1607,6 +1827,11 @@ unsafe fn realloc_live(p: ptr::NonNull<u8>, newsize: usize) -> *mut u8 {
         return unsafe { realloc_move(p, newsize, usable) };
     }
     if newsize >= usable / 2 {
+        #[cfg(feature = "audit_trace")]
+        if crate::audit::is_active() {
+            // SAFETY: `p` is non-null per caller contract.
+            unsafe { crate::audit::on_realloc_in_place(p, newsize) };
+        }
         // Keep in place. NOTE: this counter costs a TLS heap lookup (a call
         // into ld.so's __tls_get_addr in a cdylib) on the most common realloc
         // outcome, so removing it was tried as a brick -- and measured FLAT on
@@ -1866,6 +2091,11 @@ pub unsafe fn heap_realloc(hb: *mut init::HeapBox, p: *mut u8, newsize: usize) -
     // SAFETY: p live per contract.
     let usable = unsafe { usable_size(p) };
     if newsize <= usable && newsize >= usable / 2 {
+        #[cfg(feature = "audit_trace")]
+        if crate::audit::is_active() {
+            // SAFETY: `p` is non-null per caller contract.
+            unsafe { crate::audit::on_realloc_in_place(p, newsize) };
+        }
         // Debug-only counter (see `stat_realloc`): the release path returns `p`
         // with no heap touch at all.
         #[cfg(debug_assertions)]

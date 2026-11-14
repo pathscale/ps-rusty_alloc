@@ -49,12 +49,29 @@ unsafe impl GlobalAlloc for RustyAlloc {
     }
 
     #[inline]
-    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         // SAFETY: the caller passes a live pointer from this allocator.
+        #[cfg(feature = "audit_trace")]
         no_unwind!(unsafe {
             core::hint::assert_unchecked(!ptr.is_null());
+            let expected_size = if layout.align() > WORD && layout.align() <= NATURAL_ALIGN {
+                layout.size().max(NATURAL_ALIGN)
+            } else {
+                layout.size()
+            };
+            let expected_align = if layout.align() <= NATURAL_ALIGN {
+                1
+            } else {
+                layout.align()
+            };
+            crate::alloc::free_inline_layout(ptr, expected_size, expected_align)
+        });
+        #[cfg(not(feature = "audit_trace"))]
+        no_unwind!(unsafe {
+            let _ = layout;
+            core::hint::assert_unchecked(!ptr.is_null());
             crate::alloc::free_inline(ptr)
-        })
+        });
     }
 
     #[inline]

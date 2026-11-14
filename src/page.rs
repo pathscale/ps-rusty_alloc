@@ -37,7 +37,13 @@ pub mod pflags {
     pub const IN_FULL: u8 = 1 << 2;
     /// The page lives in a dedicated Huge segment (whole-reservation free).
     pub const HUGE_SEGMENT: u8 = 1 << 3;
+    /// Page is tracked by `audit_trace` (routes frees through the slow path).
+    pub const AUDIT_TRACED: u8 = 1 << 4;
     /// Mask of everything the free fast path must NOT see.
+    #[cfg(feature = "audit_trace")]
+    pub const SLOW_FREE: u8 = HAS_ALIGNED | SINGLE_BLOCK | IN_FULL | HUGE_SEGMENT | AUDIT_TRACED;
+    /// Mask of everything the free fast path must NOT see.
+    #[cfg(not(feature = "audit_trace"))]
     pub const SLOW_FREE: u8 = HAS_ALIGNED | SINGLE_BLOCK | IN_FULL | HUGE_SEGMENT;
 }
 

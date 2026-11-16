@@ -425,9 +425,14 @@ fn workers(t: usize) -> u64 {
             {
                 let ab =
                     rusty_alloc::init::ABANDONED_COUNT.load(std::sync::atomic::Ordering::Relaxed);
-                let mut line = String::new();
-                rusty_alloc::arena::arenas_print(&mut |s: &str| line.push_str(s.trim()));
-                eprintln!("  abandoned_segments={} {}", ab, line);
+                #[cfg(feature = "rusty_alloc_std")]
+                {
+                    let mut line = String::new();
+                    rusty_alloc::arena::arenas_print(&mut |s: &str| line.push_str(s.trim()));
+                    eprintln!("  abandoned_segments={} {}", ab, line);
+                }
+                #[cfg(not(feature = "rusty_alloc_std"))]
+                eprintln!("  abandoned_segments={}", ab);
             }
         }
     }

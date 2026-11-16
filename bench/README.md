@@ -5,8 +5,14 @@ library package. The only place the C mimalloc appears; it is the baseline, not
 a dependency of the library.
 
 One binary per allocator, chosen by cargo feature: `system`, `mimalloc`,
-`rusty_alloc` (this fork, through `src/ra_shim.rs`), `smalloc`,
-`baby_mimalloc`, `rlsf`, `dlmalloc`.
+`rusty_alloc` (this fork, through `src/ra_shim.rs`), `rusty_alloc_std`,
+`smalloc`, `baby_mimalloc`, `rlsf`, `dlmalloc`.
+
+`rusty_alloc` (and `debug`) build the fork without its `std` feature, so they
+measure the `no_std` thread-local paths described in
+[docs/no_std.md](../docs/no_std.md). `rusty_alloc_std` builds it with `std`,
+the configuration of the `rusty_alloc` columns in `results/`; compare against
+it to stay comparable with those results.
 
 Needs bun and macOS (`/usr/bin/time -l`).
 

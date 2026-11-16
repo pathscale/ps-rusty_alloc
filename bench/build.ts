@@ -1,7 +1,7 @@
 // Build one release binary per allocator into bin/<name>.
 // Usage: bun build.ts [names...]
 import { mkdirSync, copyFileSync } from "fs";
-export const ALL = ["system", "mimalloc", "rusty_alloc", "smalloc", "baby_mimalloc", "rlsf", "dlmalloc"];
+export const ALL = ["system", "mimalloc", "rusty_alloc", "rusty_alloc_std", "smalloc", "baby_mimalloc", "rlsf", "dlmalloc"];
 const names = process.argv.slice(2).length ? process.argv.slice(2) : ALL;
 mkdirSync("bin", { recursive: true });
 let failed = [];

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The cross-thread free word of a page moved out of `Page` into a per-slice
+  table in the segment header, `Segment::xfree`, reached through
+  `page::page_xfree` (or `page::page_xfree_of` without the segment).
+  `Page::xthread_free` is removed, `page::remote_free` takes the owning
+  segment as its first argument, and `Page` and `Segment` are now
+  `#[repr(C)]` with their fields reordered. Code using these public items
+  must be updated.
+- Without the `std` feature, on unix targets other than x86-64 Linux, the
+  default heap pointer is a pthread key slot that reads null until set and
+  is mapped to the empty heap sentinel.
+- bench: the `rusty_alloc` feature builds this crate without default
+  features; the new `rusty_alloc_std` feature builds it with `std`.
+
 ## 2.3.3 - 2026-10-11
 
 ### Added

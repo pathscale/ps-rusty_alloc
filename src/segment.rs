@@ -36,8 +36,52 @@ pub enum SegmentKind {
     Huge = 0x40BE,
 }
 
+/// Remote-free heads, one per slice: the cross-thread free word of the page
+/// whose span starts at that slice (block-list head | 2-bit flag, see
+/// `page`). Entries of interior and free slices are unused.
+///
+/// The table is the FIRST field of `Segment`, whose base is segment-aligned, so
+/// it starts on a cache line (128 B on Apple M-series) without raising the
+/// type's alignment (`prim::fixed` requires headers aligned <= REGION_ALIGN),
+/// and its 4 KiB is a whole number of lines, so remote CASes share a line with
+/// nothing the owner's alloc fast path writes. All-zero is the valid initial
+/// state (no chain, NORMAL).
+#[repr(C)]
+pub struct XFreeTable(pub [AtomicUsize; SLICES_PER_SEGMENT]);
+
+/// The header fields between `xfree` and the pad, with `Segment`'s types in
+/// `Segment`'s order: under `repr(C)` its size is where they end.
+#[repr(C)]
+struct SegmentMid(
+    SegmentKind,
+    usize,
+    u32,
+    u32,
+    AtomicUsize,
+    bool,
+    bool,
+    bool,
+    *mut Segment,
+    *mut Page,
+    [u32; SLICES_PER_SEGMENT],
+);
+
+/// Words of padding that start `pages` on a fresh 128-byte line, so owner
+/// writes to page slots never share a line with `page_off` (read by every free).
+const MID_END: usize = core::mem::size_of::<XFreeTable>() + core::mem::size_of::<SegmentMid>();
+const PAGES_PAD_WORDS: usize = ((128 - MID_END % 128) % 128) / 8;
+
 /// Segment header — occupies slice 0 of the reservation.
+///
+/// `#[repr(C)]` so the layout is fixed: `xfree` at offset 0 (a line of its own
+/// on a segment-aligned base), then the header fields, then `pages` on a fresh
+/// 128-byte line.
+#[repr(C)]
 pub struct Segment {
+    /// Cross-thread free word per slice (see [`XFreeTable`]); reach it with
+    /// `page::page_xfree`. Zeroed by `scrub_recycled` on a recycled chunk and
+    /// zero on fresh OS memory.
+    pub xfree: XFreeTable,
     /// Kind tag (doubles as a magic for `debug_checks`).
     pub kind: SegmentKind,
     /// Total reserved bytes (== SEGMENT_SIZE for Normal; the whole reservation
@@ -90,6 +134,8 @@ pub struct Segment {
     /// It duplicates state, which is a real hazard, so `debug_validate_segment`
     /// checks the two agree on every slice of every span it walks.
     pub page_off: [u32; SLICES_PER_SEGMENT],
+    /// Starts `pages` on a fresh cache line (see [`PAGES_PAD_WORDS`]).
+    _pages_pad: [u64; PAGES_PAD_WORDS],
     /// One metadata slot per slice; a span's slot is its first slice.
     pub pages: [Page; SLICES_PER_SEGMENT],
 }
@@ -107,6 +153,17 @@ pub const fn page_off_for(start: usize) -> u32 {
 const _: () = assert!(
     core::mem::size_of::<Segment>() <= SEGMENT_SLICE_SIZE,
     "segment header must fit in slice 0"
+);
+
+// The remote heads must not share a cache line with `page_off` (read by every
+// free) or with the page slots (written by every alloc).
+const _: () = assert!(
+    core::mem::offset_of!(Segment, xfree) == 0
+        && core::mem::size_of::<XFreeTable>() % 128 == 0
+        && PAGES_OFFSET % 128 == 0
+        && core::mem::offset_of!(Segment, page_off) + 4 * SLICES_PER_SEGMENT <= PAGES_OFFSET
+        && core::mem::align_of::<Segment>() <= 16,
+    "xfree must start and end on a 128-byte line"
 );
 
 /// Slices reserved for the header.
@@ -346,7 +403,7 @@ unsafe fn wait_no_remote_in_flight(seg: *mut Segment) {
     use crate::page::{XFLAG_FREEING, XMASK};
     // SAFETY: the page table is inside the live header; atomics only.
     unsafe {
-        let base: *mut Page = (&raw mut (*seg).pages).cast();
+        let xf: *const AtomicUsize = (&raw const (*seg).xfree).cast();
         // Only the CARVED region can hold a page with a remote free in flight.
         // Slots at/after `next_free_slice` were never carved, so their
         // `xthread_free` is still 0 (`& XMASK == XFLAG_NORMAL`, never
@@ -368,12 +425,7 @@ unsafe fn wait_no_remote_in_flight(seg: *mut Segment) {
             (*seg).next_free_slice as usize
         };
         for i in HEADER_SLICES..end {
-            let pg = base.add(i);
-            while (*pg)
-                .xthread_free
-                .load(core::sync::atomic::Ordering::Acquire)
-                & XMASK
-                == XFLAG_FREEING
+            while (*xf.add(i)).load(core::sync::atomic::Ordering::Acquire) & XMASK == XFLAG_FREEING
             {
                 core::hint::spin_loop();
             }
@@ -406,6 +458,11 @@ unsafe fn scrub_recycled(seg: *mut Segment, slots: usize, owner_table: bool) {
     unsafe {
         let tab = (&raw mut (*seg).page_off).cast::<u32>();
         core::ptr::write_bytes(tab, 0, if owner_table { SLICES_PER_SEGMENT } else { 1 });
+        // The remote heads of the previous tenant (flags, chains) must not be
+        // read as the next tenant's. A Normal segment zeroes them all; a Huge
+        // one only the entries it can reach (slot 1 is its page).
+        let xf = (&raw mut (*seg).xfree).cast::<usize>();
+        core::ptr::write_bytes(xf, 0, if owner_table { SLICES_PER_SEGMENT } else { slots });
         core::ptr::write_bytes((&raw mut (*seg).pages).cast::<Page>(), 0, slots);
     }
 }
@@ -852,7 +909,7 @@ pub unsafe fn span_alloc(seg: *mut Segment, slices: usize) -> (*mut Page, bool) 
         }
         // First carve of these slots in this tenancy: on a recycled chunk
         // they still hold the previous tenant's bytes (`scrub_recycled` left
-        // them), and a stale `free_is_zero` or `xthread_free` would be read
+        // them), and a stale `free_is_zero` would be read
         // as this page's. On fresh OS memory they are already zero.
         if !(*seg).mem_is_zero {
             ptr::write_bytes((&raw mut (*seg).pages).cast::<Page>().add(idx), 0, slices);

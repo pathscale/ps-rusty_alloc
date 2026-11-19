@@ -52,6 +52,7 @@ pub fn clear() {
     EXCEEDED.store(false, Ordering::SeqCst);
 }
 
+#[cfg(feature = "std")]
 pub(crate) fn limit() -> usize {
     LIMIT.load(Ordering::SeqCst)
 }
